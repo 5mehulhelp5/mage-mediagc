@@ -1,0 +1,79 @@
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    # correctness
+    - errcheck
+    - errorlint
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - sqlclosecheck
+    - rowserrcheck
+    # style and maintainability
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - unparam
+    - gocritic
+    - revive
+    - prealloc
+    - nakedret
+    - durationcheck
+    - nilerr
+    - wastedassign
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/shuaiZend/mage-mediagc
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+    disabled-checks:
+      # Option structs are passed by value on purpose: they are read-only
+      # configuration, and a value receiver makes that contract obvious and
+      # keeps the callers free of nil handling.
+      - hugeParam
+      # The codebase deliberately compares error identity in places where the
+      # standard library sentinels are the documented contract.
+      - ifElseChain
+
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - disableStutteringCheck
+      - name: package-comments
+      - name: indent-error-flow
+      - name: errorf
+      - name: context-as-argument
+      - name: unused-parameter
+        disabled: true
+
+  misspell:
+    locale: US
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Test fixtures intentionally shadow names and ignore some return values.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - unparam
+        - gocritic
+        - prealloc
+        - revive
+    # Table-driven tests legitimately use long literal lines.
+    - linters:
+        - lll
+      path: _test\.go

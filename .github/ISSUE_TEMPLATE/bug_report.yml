@@ -1,0 +1,105 @@
+name: Bug report
+description: Something behaved incorrectly, especially a wrong live/orphan classification
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report.
+
+        **Do not paste database passwords or customer data.** Run
+        `mage-mediagc config show` instead — it redacts passwords — and prefer
+        `MAGEGC_DB_PASSWORD` over `--db-password`.
+
+        If this is a security issue rather than an ordinary bug, do not open an
+        issue: use
+        [private reporting](https://github.com/shuaiZend/mage-mediagc/security/advisories/new)
+        as described in SECURITY.md.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Output of `mage-mediagc version`"
+      placeholder: "0.1.0, commit abc1234, built 2026-09-23"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Release binary
+        - deb / rpm / apk package
+        - Container image
+        - Built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command?
+      options:
+        - scan
+        - list
+        - cache stats / cache clean
+        - quarantine
+        - restore
+        - purge
+        - db-clean
+        - verify
+        - config
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect, and what happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        If the issue is a wrong classification, the exact relative path is far
+        more useful than a screenshot. Include the command line, and the
+        relevant `scan -v` output.
+      placeholder: |
+        1. Run `mage-mediagc scan -v` from /data/wwwroot/shop
+        2. `catalog/product/h/-/abc123.jpg` is reported as orphaned
+        3. It is referenced from a CMS block body, and `cms_block` reports 0 rows
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Resolved configuration
+      description: "Output of `mage-mediagc config show` (passwords are redacted)."
+      render: text
+
+  - type: input
+    id: magento
+    attributes:
+      label: Magento and MySQL versions
+      placeholder: "Magento 2.4.6-p3, MySQL 8.0.36"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I have not included any credentials or customer data
+          required: true
+        - label: I read docs/faq.md, and this is not answered there
+          required: false

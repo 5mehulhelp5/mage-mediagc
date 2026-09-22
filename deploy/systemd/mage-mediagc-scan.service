@@ -1,0 +1,45 @@
+[Unit]
+Description=mage-mediagc media scan (read-only report)
+Documentation=https://github.com/shuaiZend/mage-mediagc/blob/main/docs/operations.md
+# The shop does not need to be running, but the database does.
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Site-specific settings (MAGEGC_MAGENTO_ROOT, MAGEGC_MEDIA_PATH, ...).
+# The leading '-' makes the file optional.
+EnvironmentFile=-/etc/mage-mediagc/mage-mediagc.env
+ExecStart=/usr/local/bin/mage-mediagc scan \
+    --config /etc/mage-mediagc/mage-mediagc.yaml \
+    --format markdown \
+    --output /var/log/mage-mediagc/scan-latest.md
+
+# The scan is read-only, so it can always run as an unprivileged user. Point
+# this at the account that owns app/etc/env.php so credentials can be read.
+# User=www-data
+# Group=www-data
+
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+
+# Read-only job: lock the system down as far as possible. ProtectSystem=full
+# leaves /data and /var/www writable, which is where shop media usually lives.
+ProtectSystem=full
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mage-mediagc-scan
+
+[Install]
+WantedBy=multi-user.target

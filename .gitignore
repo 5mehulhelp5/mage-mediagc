@@ -1,0 +1,29 @@
+# Binaries
+/mage-mediagc
+/dist/
+/bin/
+*.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config & runtime artifacts
+# Anchored to the repository root on purpose: an unanchored pattern matches at
+# any depth, which would silently exclude examples/mage-mediagc.yaml.
+/config.local.yaml
+/*.local.yaml
+/mage-mediagc.yaml
+*.log
+/quarantine/
+/reports/

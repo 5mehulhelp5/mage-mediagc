@@ -1,0 +1,90 @@
+# mage-mediagc configuration.
+#
+# Every value here is optional. Resolution order, later sources winning:
+#
+#   1. built-in defaults
+#   2. this file
+#   3. <magento root>/app/etc/env.php  (fills gaps only, never overwrites)
+#   4. MAGEGC_* environment variables
+#   5. command-line flags
+#
+# The practical consequence: running `mage-mediagc scan` from a Magento root
+# needs no configuration at all, because the database credentials and the
+# media path are derived from the installation.
+
+magento:
+  # Installation root, the directory holding app/etc/env.php.
+  # Left empty, the tool walks up from the working directory to find it.
+  root: /var/www/magento
+
+  # Originals live here. Derived from root when empty:
+  #   <root>/pub/media/catalog/product
+  mediaPath: ""
+
+database:
+  # All of these are read from env.php when left empty, so in the common case
+  # you only need this section to point at a replica or a socket.
+  host: ""
+  port: 0
+  name: ""
+  user: ""
+  password: ""
+  # Overrides host/port when set.
+  socket: ""
+  charset: utf8mb4
+
+scan:
+  # Parallel walkers. 0 means one per CPU, capped at 16.
+  workers: 0
+
+  # Parse product descriptions and CMS content for embedded images.
+  # Strongly recommended: without it, an image that only appears inside page
+  # copy looks orphaned and would be quarantined. This is the single most
+  # common way a gallery-only cleaner destroys a live shop image.
+  includeContentRefs: true
+
+  # Index pub/media/catalog/product/cache as ordinary files instead of
+  # measuring it separately. Almost never what you want.
+  includeCache: false
+
+  # Skip entries whose path relative to mediaPath, or whose base name, matches
+  # one of these shell patterns. A matching directory is skipped whole.
+  # Useful for staging folders an importer left behind.
+  #   excludeGlobs:
+  #     - staging
+  #     - "*.tmp"
+  #     - "catalog/product/tmp"
+
+cleanup:
+  # Holding directory for quarantined files. Must be on the same filesystem as
+  # the media tree, otherwise a move becomes a copy and temporarily doubles
+  # disk usage. Derived from root when empty:
+  #   <root>/var/mage-mediagc/quarantine
+  quarantineDir: ""
+
+  # Rows per DELETE statement for `db-clean`. Small batches keep row locks and
+  # replication lag predictable on a live shop.
+  batchSize: 1000
+
+  # Parallel file moves. Moves are inode renames, so this scales well.
+  parallel: 0
+
+  # Permit a quarantine run whose holding directory sits on another
+  # filesystem. Off by default because the copy can fill the disk.
+  allowCrossDevice: false
+
+  # `quarantine` aborts when the orphan ratio exceeds this value, unless
+  # --force is given. A ratio above it nearly always means reference
+  # collection failed rather than that the shop really is that full of
+  # garbage, so the guard is worth keeping below 1. Range: (0, 1].
+  maxDeleteFraction: 0.98
+
+output:
+  # table | json | markdown
+  format: table
+
+  # 0 = summary, 1 = per-source detail, 2 = include the file lists
+  verbose: 0
+
+  # Suppress progress output (reports still go to stdout).
+  quiet: false

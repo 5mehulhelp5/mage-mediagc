@@ -1,0 +1,12 @@
+.git
+.github
+dist
+bin
+mage-mediagc
+coverage.txt
+coverage.out
+coverage.html
+*.md
+!README.md
+!CHANGELOG.md
+docs

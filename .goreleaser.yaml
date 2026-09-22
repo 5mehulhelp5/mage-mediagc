@@ -1,0 +1,153 @@
+version: 2
+
+project_name: mage-mediagc
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: mage-mediagc
+    main: ./cmd/mage-mediagc
+    binary: mage-mediagc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/shuaiZend/mage-mediagc/internal/version.Version={{ .Version }}
+      - -X github.com/shuaiZend/mage-mediagc/internal/version.Commit={{ .Commit }}
+      - -X github.com/shuaiZend/mage-mediagc/internal/version.BuildDate={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    ids:
+      - mage-mediagc
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - examples/*
+      - deploy/**
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Documentation
+      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: Other changes
+      order: 999
+  filters:
+    exclude:
+      - "^chore"
+      - "^ci:"
+      - "^test:"
+      - "^style:"
+      - "^Merge pull request"
+      - "^Merge branch"
+
+release:
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    # mage-mediagc {{ .Tag }}
+
+    Standalone garbage collector for Magento 2 catalog media.
+
+    Every binary is built with `CGO_ENABLED=0` and needs no runtime: drop it on
+    a server, point it at a Magento root, and run `mage-mediagc scan`.
+  footer: |
+    ## Verifying a download
+
+    ```sh
+    sha256sum --check checksums.txt --ignore-missing
+    ```
+
+    ## Nothing here deletes an original image
+
+    `scan`, `list`, `cache stats` and `config show` are read-only.
+    `cache clean`, `quarantine`, `restore`, `purge` and `db-clean` require
+    `--apply`, and orphaning is expressed as a move into a quarantine directory
+    that can be rolled back with `restore`.
+
+nfpms:
+  - id: packages
+    package_name: mage-mediagc
+    ids:
+      - mage-mediagc
+    vendor: mage-mediagc
+    homepage: https://github.com/shuaiZend/mage-mediagc
+    maintainer: mage-mediagc contributors
+    description: |
+      Standalone, reversible garbage collector for Magento 2 catalog media.
+
+      Finds and removes orphaned product images and the stale EAV and gallery
+      rows that Magento 2 leaves behind when products are deleted outside the
+      admin UI, and clears the derived thumbnail cache.
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/local/bin
+    section: admin
+    priority: optional
+    contents:
+      - src: deploy/systemd/mage-mediagc-scan.service
+        dst: /lib/systemd/system/mage-mediagc-scan.service
+      - src: deploy/systemd/mage-mediagc-scan.timer
+        dst: /lib/systemd/system/mage-mediagc-scan.timer
+      - src: deploy/systemd/mage-mediagc-cache.service
+        dst: /lib/systemd/system/mage-mediagc-cache.service
+      - src: deploy/systemd/mage-mediagc-cache.timer
+        dst: /lib/systemd/system/mage-mediagc-cache.timer
+      - src: examples/mage-mediagc.yaml
+        dst: /etc/mage-mediagc/mage-mediagc.yaml
+        type: config|noreplace
+      - src: examples/mage-mediagc.env
+        dst: /etc/mage-mediagc/mage-mediagc.env
+        type: config|noreplace
+      - dst: /var/lib/mage-mediagc
+        type: dir
+      - dst: /var/log/mage-mediagc
+        type: dir
+    scripts:
+      postinstall: deploy/scripts/postinstall.sh
+
+# Source archives are produced by GitHub itself; the binaries above are the
+# artefacts users actually need.
+source:
+  enabled: true

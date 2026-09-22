@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly mage-mediagc media scan
+Documentation=https://github.com/shuaiZend/mage-mediagc/blob/main/docs/operations.md
+
+[Timer]
+# Sunday at 03:30 plus a random delay so a fleet of shops does not stampede
+# the database at the same instant.
+OnCalendar=Sun *-*-* 03:30:00
+RandomizedDelaySec=30m
+Persistent=true
+Unit=mage-mediagc-scan.service
+
+[Install]
+WantedBy=timers.target

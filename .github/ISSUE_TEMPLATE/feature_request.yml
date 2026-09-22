@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose a new capability or a change in behaviour
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a tool that deletes things, so proposals that touch the
+        destructive paths get reviewed against the design rules in
+        CONTRIBUTING.md: dry run by default, move-never-delete, and "a false
+        live costs disk space while a false orphan loses an image".
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the situation, not the solution. What can't you do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should the tool do? Include the command line or config you would expect to type.
+      placeholder: |
+        mage-mediagc scan --something-new
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including "do nothing, and solve it by …", which is sometimes the right answer.
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Does this read, move or delete?
+      description: This determines how much testing the change needs.
+      options:
+        - Read-only (reporting, classification, output)
+        - Moves files, and is reversible
+        - Deletes files or database rows
+        - Packaging, CI or documentation only
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I checked docs/reference.md in case this already exists
+          required: true

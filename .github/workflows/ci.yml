@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  # Fast feedback: formatting, vet and the linter, before the slower jobs.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Verify gofmt
+        run: |
+          unformatted="$(gofmt -s -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files need gofmt -s -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62.2
+          args: --timeout=5m
+
+      - name: go mod tidy is a no-op
+        run: |
+          cp go.mod go.mod.bak
+          cp go.sum go.sum.bak
+          go mod tidy
+          diff -u go.mod.bak go.mod || {
+            echo "::error::go.mod is not tidy; run 'go mod tidy'"
+            exit 1
+          }
+          diff -u go.sum.bak go.sum || {
+            echo "::error::go.sum is not tidy; run 'go mod tidy'"
+            exit 1
+          }
+
+  test:
+    name: Test (${{ matrix.os }}, go ${{ matrix.go }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        go: ["1.21.x", "1.22.x", "1.23.x", "1.24.x"]
+        include:
+          # The build must also work on developer machines, where the device
+          # detection in the action package takes a different code path.
+          - os: macos-latest
+            go: "1.24.x"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (race + coverage)
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.go }}
+          path: coverage.out
+          if-no-files-found: ignore
+
+  # Runs the real thing against real MySQL versions. This is the job that
+  # proves the database cleanup logic, including the cascade where removing a
+  # product's last gallery link orphans the gallery entry and then its values.
+  integration:
+    name: Integration (MySQL ${{ matrix.mysql }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.0"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: itsecret
+          MYSQL_DATABASE: magegc_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysql -h127.0.0.1 -uroot -pitsecret -N -e 'SELECT 1'"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Run integration tests
+        env:
+          MAGEGC_TEST_DB_HOST: 127.0.0.1
+          MAGEGC_TEST_DB_PORT: "3306"
+          MAGEGC_TEST_DB_NAME: magegc_test
+          MAGEGC_TEST_DB_USER: root
+          MAGEGC_TEST_DB_PASSWORD: itsecret
+        run: go test -v -count=1 ./internal/integration/
+
+  # Confirms the release pipeline can produce every advertised artefact.
+  build:
+    name: Build artefacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Cross-compile the supported target matrix
+        run: |
+          set -euo pipefail
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              echo "==> ${os}/${arch}"
+              GOOS="$os" GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w -X github.com/shuaiZend/mage-mediagc/internal/version.Version=ci" \
+                -o /dev/null ./cmd/mage-mediagc
+            done
+          done
+
+      - name: goreleaser snapshot
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          # Pinned to the version .goreleaser.yaml is authored against; see
+          # release.yml for why it is not a floating "~> v2".
+          version: "v2.18.2"
+          args: release --snapshot --clean --skip=publish,sbom
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload snapshot artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot
+          path: dist/*.tar.gz
+          if-no-files-found: error

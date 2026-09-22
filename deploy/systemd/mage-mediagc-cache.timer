@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily mage-mediagc thumbnail cache cleanup
+Documentation=https://github.com/shuaiZend/mage-mediagc/blob/main/docs/operations.md
+
+[Timer]
+# Quiet hour, jittered. The cache rebuilds itself on demand, so an occasional
+# extra rebuild costs a little CPU and nothing else.
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=45m
+Persistent=true
+Unit=mage-mediagc-cache.service
+
+[Install]
+WantedBy=timers.target
