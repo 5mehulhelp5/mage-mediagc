@@ -136,7 +136,7 @@ scan.
 Because it does not free space, it just moves it. On the same filesystem,
 `os.Rename` is an inode operation — microseconds per file, no data copied. That
 is why isolating hundreds of thousands of files takes seconds. The space is only
-returned when you `purge`.
+actually returned when you `purge`.
 
 Corollary: **quarantining does not solve a disk-full emergency.** If the
 filesystem is full, you need `purge`, and therefore you need to be confident

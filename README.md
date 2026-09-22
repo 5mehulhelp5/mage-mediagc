@@ -2,6 +2,8 @@
 
 **A standalone, reversible garbage collector for Magento 2 catalog media.**
 
+**English** · [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/shuaiZend/mage-mediagc/actions/workflows/ci.yml/badge.svg)](https://github.com/shuaiZend/mage-mediagc/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/shuaiZend/mage-mediagc/actions/workflows/codeql.yml/badge.svg)](https://github.com/shuaiZend/mage-mediagc/actions/workflows/codeql.yml)
 [![Release](https://img.shields.io/github/v/release/shuaiZend/mage-mediagc)](https://github.com/shuaiZend/mage-mediagc/releases)
@@ -28,7 +30,9 @@ direct `DELETE`, a failed migration, an extension — and nothing cascades:
 Nothing in `bin/magento` removes any of it. There is no official image GC
 command. The growth is silent and permanent.
 
-This is not a theoretical concern. On one long-running production catalog:
+This is not a theoretical concern. Profiling one long-running production
+catalog produced the following — figures rounded, because the exact ones say
+more about the shop than about the problem:
 
 | Measurement | Value |
 | --- | --- |
@@ -87,8 +91,9 @@ protects `catalog/product/placeholder/` outright.
 The design rule is simple: **nothing deletes an original image.** Removing an
 orphan means *moving* it into a holding directory on the same filesystem,
 where `os.Rename` is an inode operation — microseconds per file, no extra disk
-space, no copy. Isolating hundreds of thousands of files takes seconds. If the shop looks wrong
-afterwards, `restore` puts every file back exactly where it came from.
+space, no copy. Isolating hundreds of thousands of files takes seconds. If the
+shop looks wrong afterwards, `restore` puts every file back exactly where it
+came from.
 
 ## Install
 
@@ -166,10 +171,11 @@ mage-mediagc purge --apply
 mage-mediagc restore --apply
 ```
 
-A scan on the catalog described above reports:
+Example output against a catalog of that size. The shop is illustrative; the
+format is exactly what the tool prints.
 
 ```
-mage-mediagc 0.1.0
+mage-mediagc 0.2.0
 ──────────────────────────────────────────────────────────────
 media root /var/www/magento/pub/media/catalog/product
 magento    /var/www/magento
@@ -188,9 +194,9 @@ reference sources
   media_gallery          31500 rows  +31500 paths  catalog_product_entity_media_gallery joined to existing products
   product_image_attr     10240 rows  +1240 paths   image, small_image, thumbnail, swatch_image attributes
   product_content        5990 rows   +3530 paths   images embedded in product descriptions
-  cms_content_cms_page   48 rows     +21 paths     images embedded in cms_page
-  cms_content_cms_block  61 rows     +19 paths     images embedded in cms_block
   category_image         172 rows    +172 paths    category image and thumbnail attributes
+  cms_content_cms_block  61 rows     +19 paths     images embedded in cms_block
+  cms_content_cms_page   48 rows     +21 paths     images embedded in cms_page
 
 orphan hotspots
   2/1  13200 / 17900  2.83 GB  73.7%
@@ -212,9 +218,8 @@ warnings
   ! 30.5% of files look orphaned (abort threshold 98%)
 ```
 
-Output from a real run against the catalog described above. `-v` adds the
-reference-source breakdown shown here; `--top-dirs` controls how many orphan
-hotspots are listed.
+`-v` adds the reference-source breakdown shown here; `--top-dirs` controls how
+many orphan hotspots are listed.
 
 `--format json` and `--format markdown` produce machine-readable and
 ticket-ready versions of the same report. The Markdown version is a
@@ -288,6 +293,7 @@ procedure: [docs/deployment.md](docs/deployment.md) and
 
 | Document | Contents |
 | --- | --- |
+| [README.zh-CN.md](README.zh-CN.md) | 简体中文 README — quick start and a worked example of the Chinese report |
 | [docs/reference.md](docs/reference.md) | Every command, flag, config key, environment variable and on-disk artefact |
 | [docs/configuration.md](docs/configuration.md) | The five configuration sources and how they interact |
 | [docs/deployment.md](docs/deployment.md) | Install paths, packages, container, systemd, staged rollout |
@@ -389,6 +395,9 @@ values.
 - MySQL 5.7+ or MariaDB 10.2+ reachable with read/write access for
   `db-clean`; read-only is enough for everything else
 - No PHP on the host, no `bin/magento`, no Composer
+- A Unix-like host. Binaries are published for Linux and macOS only: the safety
+  guarantees rest on POSIX device numbers and file ownership, and the steps that
+  depend on them refuse to run on a platform without them rather than guess.
 
 ## Contributing
 

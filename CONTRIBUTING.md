@@ -20,6 +20,13 @@ move.
 **A false "live" costs disk space; a false "orphan" loses an image.** When you
 have to choose, choose the conservative option, and say why in a comment.
 
+**Keep every example generic.** `examples/*`, the READMEs, `docs/` and test
+fixtures are copied verbatim onto public pages, and goreleaser packs `examples/`
+and `deploy/` into every release archive. Never commit a real Magento root, real
+database name, real admin frontName, hostname or IP — use `/var/www/magento`,
+`magento` and `admin_x7k2p` instead. Statistics quoted from a real catalog must
+be rounded: the scale is the point, the exact figures are a fingerprint.
+
 ## Getting started
 
 ```sh

@@ -494,6 +494,23 @@ files if any. Localized via `--language`.
 
 In all three formats, logs, errors and the JSON payload stay English.
 
+### Localization
+
+`--language zh` translates the report labels, the summary table, the orphan
+hotspots and the numbered next steps.
+
+Strings produced by the analysis itself stay English: warnings, per-source skip
+reasons and error text. They are diagnostic, and they are the strings people
+paste into bug reports, so translating them would make reports harder to compare
+across installations.
+
+One known cosmetic limitation: the `table` format aligns its columns with Go's
+`text/tabwriter`, which measures a cell in runes rather than display columns. A
+CJK label is therefore credited with half the columns it occupies, and the
+`table` output of a Chinese report is visibly misaligned. `markdown` and `json`
+are unaffected, and `markdown` is the format intended for a ticket. Correcting
+it needs a display-width-aware column writer rather than `tabwriter`.
+
 ---
 
 ## Compatibility notes

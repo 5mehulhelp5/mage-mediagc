@@ -163,10 +163,10 @@ ratio far below 1 is the first sign that a reference source failed. Use
 reference sources
   media_gallery          31500 rows  +31500 paths  catalog_product_entity_media_gallery joined to existing products
   product_image_attr     10240 rows  +1240 paths   image, small_image, thumbnail, swatch_image attributes
-  category_image         172 rows    +172 paths    category image and thumbnail attributes
   product_content        5990 rows   +3530 paths   images embedded in product descriptions
-  cms_content_cms_page   48 rows     +21 paths     images embedded in cms_page
+  category_image         172 rows    +172 paths    category image and thumbnail attributes
   cms_content_cms_block  61 rows     +19 paths     images embedded in cms_block
+  cms_content_cms_page   48 rows     +21 paths     images embedded in cms_page
 ```
 
 ## Upgrading

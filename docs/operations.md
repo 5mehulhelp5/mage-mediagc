@@ -319,7 +319,7 @@ df -h /data
 ## Capacity planning
 
 Rough figures from the catalog profiled in the README, for a single 4-core
-server with SSD storage:
+server with SSD storage. They are orders of magnitude, not benchmarks:
 
 | Operation | Volume | Time |
 | --- | --- | --- |
