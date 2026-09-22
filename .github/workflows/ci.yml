@@ -158,7 +158,7 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
-          for os in linux darwin windows; do
+          for os in linux darwin; do
             for arch in amd64 arm64; do
               echo "==> ${os}/${arch}"
               GOOS="$os" GOARCH="$arch" go build -trimpath \

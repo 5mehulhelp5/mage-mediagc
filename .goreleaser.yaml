@@ -12,10 +12,14 @@ builds:
     binary: mage-mediagc
     env:
       - CGO_ENABLED=0
+    # Linux and macOS only. Magento 2 shops run on Linux, and the guards that
+    # make this tool safe to point at a live catalog — same-filesystem
+    # detection and ownership preservation — are POSIX operations. Shipping a
+    # Windows binary would mean shipping a code path that no CI job exercises
+    # and that operators cannot use, so it is not built at all.
     goos:
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
       - arm64
@@ -36,13 +40,10 @@ archives:
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     formats:
       - tar.gz
-    format_overrides:
-      - goos: windows
-        formats:
-          - zip
     files:
       - LICENSE
       - README.md
+      - README.zh-CN.md
       - CHANGELOG.md
       - examples/*
       - deploy/**

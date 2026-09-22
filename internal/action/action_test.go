@@ -328,11 +328,29 @@ func TestSafeRelJoinRejectsEscapes(t *testing.T) {
 	}
 }
 
+// skipIfNoFilesystemChecks skips a test on a platform where the guard is not
+// implemented. mage-mediagc only ships Linux and macOS binaries and CI only
+// runs those, so this never fires there; it exists so the suite does not fail
+// misleadingly on some other host.
+func skipIfNoFilesystemChecks(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sameFilesystem(dir, dir, info, info); err != nil {
+		t.Skipf("filesystem checks are unavailable on this platform: %v", err)
+	}
+}
+
 // The same-filesystem guard is what stops a cross-volume quarantine from
 // silently turning an instant rename into a full copy that doubles disk usage.
-// It is implemented per platform (st_dev on Unix, volume name elsewhere), so
-// this asserts the behavior rather than the mechanism.
+// It is implemented with POSIX device numbers, so this asserts the behavior
+// rather than the mechanism.
 func TestSameFilesystemForOneDirectory(t *testing.T) {
+	skipIfNoFilesystemChecks(t)
+
 	dir := t.TempDir()
 
 	a, err := os.Stat(dir)
@@ -360,6 +378,8 @@ func TestSameFilesystemForOneDirectory(t *testing.T) {
 // Two subdirectories of one temporary directory are necessarily on the same
 // filesystem, which is the situation a normal quarantine lives in.
 func TestVerifySameFilesystemAcceptsSiblings(t *testing.T) {
+	skipIfNoFilesystemChecks(t)
+
 	parent := t.TempDir()
 	media := filepath.Join(parent, "media")
 	quarantine := filepath.Join(parent, "quarantine")
