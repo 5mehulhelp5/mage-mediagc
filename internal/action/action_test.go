@@ -327,3 +327,44 @@ func TestSafeRelJoinRejectsEscapes(t *testing.T) {
 		}
 	}
 }
+
+// The same-filesystem guard is what stops a cross-volume quarantine from
+// silently turning an instant rename into a full copy that doubles disk usage.
+// It is implemented per platform (st_dev on Unix, volume name elsewhere), so
+// this asserts the behavior rather than the mechanism.
+func TestDeviceOfIsStableForOneDirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := deviceOf(dir)
+	if err != nil {
+		t.Fatalf("deviceOf(%s): %v", dir, err)
+	}
+	second, err := deviceOf(dir)
+	if err != nil {
+		t.Fatalf("deviceOf(%s) (second call): %v", dir, err)
+	}
+	if first != second {
+		t.Errorf("deviceOf is not stable for one directory: %d then %d", first, second)
+	}
+
+	if err := verifySameFilesystem(dir, dir); err != nil {
+		t.Errorf("a directory must be on the same filesystem as itself: %v", err)
+	}
+}
+
+// Two subdirectories of one temporary directory are necessarily on the same
+// filesystem, which is the situation a normal quarantine lives in.
+func TestVerifySameFilesystemAcceptsSiblings(t *testing.T) {
+	parent := t.TempDir()
+	media := filepath.Join(parent, "media")
+	quarantine := filepath.Join(parent, "quarantine")
+	for _, d := range []string{media, quarantine} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := verifySameFilesystem(media, quarantine); err != nil {
+		t.Errorf("sibling directories should pass the check: %v", err)
+	}
+}

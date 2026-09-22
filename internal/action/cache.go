@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/shuaiZend/mage-mediagc/internal/media"
 )
@@ -51,11 +50,9 @@ func CleanCache(ctx context.Context, mediaRoot string, dryRun bool, progress fun
 	}
 
 	// Record ownership so the recreated directory keeps the web server's
-	// user, which matters when running as root.
-	var uid, gid int
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		uid, gid = int(st.Uid), int(st.Gid)
-	}
+	// user, which matters when running as root. Platforms without POSIX
+	// ownership report ok == false, and the chown below is then skipped.
+	uid, gid, haveOwner := dirOwnership(info)
 
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
@@ -111,7 +108,7 @@ func CleanCache(ctx context.Context, mediaRoot string, dryRun bool, progress fun
 	if err := os.MkdirAll(cacheDir, 0o775); err != nil {
 		return res, fmt.Errorf("recreate cache dir: %w", err)
 	}
-	if uid != 0 || gid != 0 {
+	if haveOwner && (uid != 0 || gid != 0) {
 		// Best effort: non-root users cannot chown, and that is fine.
 		_ = os.Chown(cacheDir, uid, gid)
 	}
@@ -187,11 +184,11 @@ func deviceOf(path string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
+	dev, ok := deviceID(path, info)
 	if !ok {
-		return 0, fmt.Errorf("cannot determine device for %s", path)
+		return 0, fmt.Errorf("cannot determine the filesystem device for %s", path)
 	}
-	return uint64(st.Dev), nil
+	return dev, nil
 }
 
 // safeRelJoin joins a relative path onto a base, refusing escapes.
