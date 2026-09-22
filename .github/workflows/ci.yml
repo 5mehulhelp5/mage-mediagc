@@ -13,8 +13,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CGO_ENABLED: "0"
+# CGO_ENABLED is deliberately NOT set here. `go test -race` needs cgo on Linux
+# and aborts with "-race requires cgo" if it is disabled globally, which would
+# fail every Linux test job while macOS happened to pass. It is set to 0 only
+# in the steps that must produce static binaries.
 
 jobs:
   # Fast feedback: formatting, vet and the linter, before the slower jobs.
@@ -151,6 +153,9 @@ jobs:
           cache: true
 
       - name: Cross-compile the supported target matrix
+        env:
+          # Every shipped binary is static and needs no runtime.
+          CGO_ENABLED: "0"
         run: |
           set -euo pipefail
           for os in linux darwin windows; do

@@ -161,34 +161,26 @@ func EnsureMediaPathExists(mediaRoot string) error {
 // verifySameFilesystem makes sure a move will be an inode rename rather than a
 // cross-device copy, which would double disk usage and take hours.
 func verifySameFilesystem(a, b string) error {
-	devA, err := deviceOf(a)
+	aInfo, err := os.Stat(a)
 	if err != nil {
 		return err
 	}
-	devB, err := deviceOf(b)
+	bInfo, err := os.Stat(b)
 	if err != nil {
 		return err
 	}
-	if devA != devB {
+	same, err := sameFilesystem(a, b, aInfo, bInfo)
+	if err != nil {
+		return err
+	}
+	if !same {
 		return fmt.Errorf(
-			"quarantine directory %s is on a different filesystem than %s "+
-				"(device %d vs %d): moving files would copy them and temporarily double disk usage. "+
+			"quarantine directory %s is on a different filesystem than %s: "+
+				"moving files would copy them and temporarily double disk usage. "+
 				"Point --quarantine-dir at the same volume, or pass --allow-cross-device",
-			b, a, devB, devA)
+			b, a)
 	}
 	return nil
-}
-
-func deviceOf(path string) (uint64, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-	dev, ok := deviceID(path, info)
-	if !ok {
-		return 0, fmt.Errorf("cannot determine the filesystem device for %s", path)
-	}
-	return dev, nil
 }
 
 // safeRelJoin joins a relative path onto a base, refusing escapes.

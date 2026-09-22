@@ -332,23 +332,28 @@ func TestSafeRelJoinRejectsEscapes(t *testing.T) {
 // silently turning an instant rename into a full copy that doubles disk usage.
 // It is implemented per platform (st_dev on Unix, volume name elsewhere), so
 // this asserts the behavior rather than the mechanism.
-func TestDeviceOfIsStableForOneDirectory(t *testing.T) {
+func TestSameFilesystemForOneDirectory(t *testing.T) {
 	dir := t.TempDir()
 
-	first, err := deviceOf(dir)
+	a, err := os.Stat(dir)
 	if err != nil {
-		t.Fatalf("deviceOf(%s): %v", dir, err)
+		t.Fatal(err)
 	}
-	second, err := deviceOf(dir)
+	b, err := os.Stat(dir)
 	if err != nil {
-		t.Fatalf("deviceOf(%s) (second call): %v", dir, err)
+		t.Fatal(err)
 	}
-	if first != second {
-		t.Errorf("deviceOf is not stable for one directory: %d then %d", first, second)
+
+	same, err := sameFilesystem(dir, dir, a, b)
+	if err != nil {
+		t.Fatalf("sameFilesystem(%s, %s): %v", dir, dir, err)
+	}
+	if !same {
+		t.Error("a directory must be on the same filesystem as itself")
 	}
 
 	if err := verifySameFilesystem(dir, dir); err != nil {
-		t.Errorf("a directory must be on the same filesystem as itself: %v", err)
+		t.Errorf("verifySameFilesystem must accept one directory: %v", err)
 	}
 }
 
