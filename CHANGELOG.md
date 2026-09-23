@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **One request per original, not per variant.** Since Magento 2.3 a request for
   one cached URL regenerates that image's variant in *every* size set the theme
-  defines — twenty-five of them on a stock Ultimo theme — so the job is as large
+  defines — twenty-five of them on a stock theme — so the job is as large
   as the catalog rather than as large as the URL space. Measured on a 2.3.7
   install: 3 requests produced 75 variants (3 images × 25 sets), a warm hit costs
   0.25 ms and a miss 0.85 s.
