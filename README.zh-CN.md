@@ -83,15 +83,39 @@ reclaimable
 mage-mediagc scan -v
 ```
 
-### ④ 清派生缓存（零风险，建议先做）
+### ④ 清派生缓存（零风险），然后预热
 
-Magento 的缩略图缓存是派生数据，删掉后访客访问时会自动重建。这是最安全的一刀。
+Magento 的缩略图缓存是派生数据，删掉后访客访问时会自动重建。这是最安全的一刀，
+代价是「重建」要由第一批访客来承担——他们得等 PHP 现场缩放图片。
+
+`cache warm` 把这份代价提前扛下来：它把每张原图和主题用到的每种尺寸组合配对，
+然后**通过店面**请求那些派生 URL，让 Magento 走一遍和访客浏览器完全相同的代码路径
+生成。所以它不需要在店铺里装任何东西：不要 PHP 运行时、不要 `bin/magento`、
+不要 Composer、不要模块——只需要能访问店面的 HTTP，因此可以从笔记本、跳板机或 CI
+对着一个你没有 shell 的站点跑。
 
 ```sh
 mage-mediagc cache stats
 mage-mediagc cache clean          # 预演，只报告不动手
-mage-mediagc cache clean --apply  # 实际清空
+# 清空前先把尺寸组合记下来——清空之后就再也找不回来了
+mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
+# 预热：先预演（不发出任何请求，只报工作量），再真跑
+mage-mediagc cache warm --hash-file var/cache-hashes.txt
+mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
 ```
+
+**`--save-hashes` 是这一步唯一的要点。** Magento 用尺寸参数的 md5 给每个缓存目录
+命名，这个哈希来自 PHP 侧、无法在 Go 里算出来，所以工具是**从目录里读出来**的——
+而只有缓存还在的时候才读得到。快照文件就是让这个信息跨过「清空」与「重填」之间的
+空档的东西。没有快照，尺寸组合就只能等第一批访客一个请求一个请求地重新暴露出来。
+
+两个设计让它敢对着线上站点跑：已经存在的变体用本地 `stat` 跳过、不发请求，所以
+中断后重跑几乎零成本、也不会重复生成；正式开跑前会**先单独发一个请求**并检查它的
+缓存文件是否真的出现——如果请求返回 200 却没有生成文件，整轮立即中止，因为那正是
+CDN 或反代在边缘直接应答的样子。
+
+顺带一提，「干脆用 `php bin/magento catalog:images:resize`」是更差的选择：那条命令
+单线程、会重复处理已存在的变体、且不能中断；`cache warm` 跳过已有的、并发做剩下的。
 
 ### ⑤ 隔离孤儿原图（是「移动」，不是「删除」）
 
@@ -135,7 +159,8 @@ mage-mediagc db-clean --apply     # 再删
 | 输出 JSON / Markdown | `mage-mediagc scan -f json -o report.json` |
 | 输出**中文**报告 | `mage-mediagc scan --language zh -f markdown -o 报告.md` |
 | 列出孤儿文件路径（喂给 rsync） | `mage-mediagc list --kind orphan -o orphans.txt` |
-| 清缩略图缓存 | `mage-mediagc cache clean --apply` |
+| 清缩略图缓存 | `mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt` |
+| 重建缩略图缓存（预热） | `mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply` |
 | 隔离孤儿原图 / 回滚 | `mage-mediagc quarantine --apply` / `mage-mediagc restore --apply` |
 | 真删、释放空间 | `mage-mediagc purge --apply` |
 | 清数据库孤儿行 | `mage-mediagc db-clean --apply` |
@@ -209,6 +234,7 @@ Magento 2 **没有**媒体文件的垃圾回收机制。
 | --- | --- | --- | --- |
 | 出报告 | `scan` | 无，只读 | — |
 | 清缩略图 | `cache clean --apply` | 无，Magento 会自动重建 | — |
+| 预热缩略图 | `cache warm --apply` | 无，但负载落在店面 PHP 上 | — |
 | 隔离孤儿 | `quarantine --apply` | 文件被移动，原图完好 | `restore --apply` |
 | 释放空间 | `purge --apply` | **不可逆** | 否 |
 | 清数据库行 | `db-clean --apply` | **不可逆** | 从备份恢复 |
@@ -313,6 +339,8 @@ journalctl -u mage-mediagc-scan.service -n 50
 ## 安全模型
 
 - **先读后写。** `scan`、`list`、`cache stats`、`config show`、`verify` 不可能改动任何东西。
+- **预热只写派生文件。** `cache warm` 向店面发 HTTP 请求，让 Magento 用自己的代码路径生成
+  变体。它绝不碰原图，生成的东西也全都是 `cache clean` 会再删掉的那类文件。
 - **默认预演。** 所有破坏性命令都必须显式加 `--apply`。
 - **只移动，不删除。** 孤儿文件被重命名进暂存目录，并写下记录每个路径的 JSONL 清单，
   因此 `restore` 是精确的。
@@ -384,6 +412,7 @@ Markdown 报告会翻译表头、摘要表、孤儿集中目录和后续步骤�
 │   ├── media/                并行媒体目录扫描
 │   ├── analyzer/             存活/孤儿判定与统计
 │   ├── action/               缓存清理、隔离、还原、purge
+│   ├── warm/                 通过 HTTP 预热缩略图缓存
 │   ├── report/               table / JSON / Markdown 渲染
 │   └── cli/                  cobra 命令层
 ├── internal/integration/     针对真实 MySQL 的端到端测试
@@ -433,7 +462,9 @@ scan → analyze → 预演 → 清理 → 隔离 → 还原 → purge 并断言
 ## 环境要求
 
 - 一套 Magento 2 安装（已在 2.2、2.3、2.4 的库表结构上测试），或任何 `magento_*` 形状的数据库
-- MySQL 5.7+ 或 MariaDB 10.2+；`db-clean` 需要读写权限，其余命令只读即可
+- MySQL 5.7+ 或 MariaDB 10.2+；`db-clean` 需要读写权限，其余命令只读即可。
+  另外：`cache stats`、`cache clean`、`config show` 以及显式传了 `--base-url` 的
+  `cache warm` **完全不连数据库**，因此可以在一个够不到库的机器上跑
 - 宿主机上不需要 PHP，不需要 `bin/magento`，不需要 Composer
 - Unix 系主机。二进制**只发布** Linux 与 macOS：安全保证依赖 POSIX 设备号与文件属主，
   依赖这些的步骤在没有它们的平台上会**拒绝执行**，而不是去猜

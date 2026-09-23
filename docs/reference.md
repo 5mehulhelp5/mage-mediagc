@@ -9,6 +9,7 @@ variables and on-disk artefacts.
   - [`scan`](#scan)
   - [`list`](#list)
   - [`cache`](#cache)
+    - [`cache warm`](#cache-warm)
   - [`quarantine`](#quarantine)
   - [`restore`](#restore)
   - [`purge`](#purge)
@@ -36,9 +37,12 @@ With no command, the help text is printed. Running from a Magento installation
 root requires no configuration at all: the database credentials, media path and
 table prefix are read from `app/etc/env.php`.
 
-Mutating commands (`cache clean`, `quarantine`, `restore`, `purge`, `db-clean`)
-perform a **dry run** unless `--apply` is given. There is no `--dry-run` flag,
-because the dry run is the default.
+Mutating commands (`cache clean`, `cache warm`, `quarantine`, `restore`,
+`purge`, `db-clean`) perform a **dry run** unless `--apply` is given. There is
+no `--dry-run` flag, because the dry run is the default. `cache warm`'s dry run
+goes further than most: it resolves the size sets, walks the media tree and
+costs the whole job, so the first thing you learn is how many requests the real
+run would issue.
 
 ## Global flags
 
@@ -132,7 +136,8 @@ available.
 | Subcommand | Flags | Description |
 | --- | --- | --- |
 | `cache stats` | — | Report the file count and size of the derived cache. |
-| `cache clean` | `--apply` | Empty the cache tree and recreate it with the same ownership, so the web server can keep writing to it. |
+| `cache clean` | `--apply`, `--save-hashes <path>` | Empty the cache tree and recreate it with the same ownership, so the web server can keep writing to it. |
+| `cache warm` | see below | Refill the tree by requesting the derived URLs. |
 
 `cache clean` only ever targets the cache directory below the resolved media
 path, and recreates it immediately, so there is no `--force` because there is no
@@ -144,8 +149,102 @@ mage-mediagc cache clean            # report what would be freed
 mage-mediagc cache clean --apply
 ```
 
-Expect a temporary slowdown on the first requests afterwards. Consider warming
-the cache with `php bin/magento catalog:images:resize`.
+`--save-hashes` records the size-set hashes present in the tree to a file
+*before* the deletion, and only when `--apply` is also given:
+
+```sh
+mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
+```
+
+The file is not a backup of the cache; it is the only record of which size sets
+the theme asks for, and `cache warm --hash-file` is what reads it back. Without
+it, Magento learns the size sets again from whatever the first visitors request.
+
+Expect a temporary slowdown on the first requests afterwards, and warm the cache
+to avoid it — see below.
+
+### `cache warm`
+
+Refills the derived cache by pairing every original image with every size set
+and requesting the resulting URLs through the storefront. Magento generates each
+missing variant through the same code path a visitor's browser would take, which
+is why this needs no PHP runtime, no `bin/magento`, no Composer and no module
+installed on the host.
+
+It is aimed at the cost `cache clean` defers onto the first visitors: on a large
+catalog, a product page that would have served a cached file instead waits for
+PHP to resize an image. Warming pays that cost up front, concurrently, while
+nobody is waiting.
+
+How the size sets are resolved, most explicit source first:
+
+1. `--cache-hash` (repeatable)
+2. `warm.cacheHashes` in the config file
+3. `--hash-file`, or `warm.hashFile`
+4. discovered by listing the size-set directories under
+   `media/catalog/product/cache/`
+
+The hash is Magento's own: an md5 of PHP-side size parameters, used verbatim as
+the directory name. It is **discovered, never computed** — the parameters are
+private to Magento's image pipeline, and a wrong hash means requesting a URL
+space that does not exist, where every request returns 200 and generates
+nothing. Discovery only works while the cache still holds the hashes, which is
+the entire reason `cache clean --save-hashes` exists.
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--apply` | off | Issue the requests. Without it, the plan is reported and nothing is requested. |
+| `--base-url <url>` | `web/secure/base_url` | Storefront URL the cache URLs are resolved against. Read from `core_config_data` when omitted, which needs the database. A URL with a query or fragment is rejected. |
+| `--cache-hash <hash>` | — | Pin a size set. Repeatable. Each value must be 32 lowercase hex characters. |
+| `--hash-file <path>` | `warm.hashFile` | Read size sets from a snapshot. `#` comments and blank lines are ignored, duplicates are collapsed. |
+| `--concurrency <int>` | `warm.concurrency` (`4`) | Requests in flight. |
+| `--timeout <duration>` | `warm.timeout` (`30s`) | Timeout for one request. |
+| `--method <get\|head>` | `warm.method` (`get`) | `head` saves the transfer but a caching proxy may answer it from the edge without generating anything. |
+| `--user-agent <string>` | `warm.userAgent` | Sent with every request. The built-in default names and versions the tool. |
+| `--rate <int>` | `warm.rate` (`0`) | Cap on request starts per second across all workers. `0` is unlimited. |
+| `--max-requests <int>` | `warm.maxRequests` (`0`) | Stop after this many requests, for warming a large catalog in slices. |
+| `--max-error-fraction <float>` | `warm.maxErrorFraction` (`0.05`) | Fail the run when the share of non-2xx responses exceeds this. Range `(0, 1]`. |
+| `--live-only` | off | Run the full reference analysis first and warm only images that are still referenced. Needs the database. |
+| `--no-probe` | off | Skip the pre-flight request described below. |
+
+Values that would otherwise be silently corrected are rejected instead:
+`--concurrency 0` would become one worker, `--timeout 0` thirty seconds, and
+`--max-error-fraction 0` the default. All of them fail before the media tree is
+walked, so a typo never costs a scan of a large catalog.
+
+#### The pre-flight check
+
+One request is issued on its own before the pool starts, and the cache file it
+should have produced is looked for. If the request succeeded and no file
+appeared, the run stops immediately.
+
+The failure this catches is silent: a CDN, a Varnish layer or a reverse proxy in
+front of the web server can answer the request from the edge, returning 200
+without PHP ever running. Every subsequent request would also return 200, the
+run would look like a success, and the cache would still be empty. Passing
+`--no-probe` after confirming the URL mapping by hand is the escape hatch.
+
+#### Re-running and resuming
+
+A variant that already exists is skipped with a local `stat`, not a request.
+Interrupting a run therefore costs nothing: start it again and it finds only
+what is still missing. This is also what makes `--max-requests` a usable way to
+warm in slices.
+
+#### What it does not do
+
+- It does not warm webp or CMYK variants. Magento decides whether to produce
+  those from configuration this command does not read; they are generated on
+  demand as usual.
+- It does not talk to Magento's own resize command. `catalog:images:resize` is
+  single-threaded, re-resizes variants that already exist and cannot be
+  interrupted — the opposite of what is wanted here.
+- It does not verify that a generated file is a *correct* image. It checks that
+  the request succeeded and the expected path now exists; the pixels are
+  Magento's business.
+- It does not (yet) offer a way to warm from a list of URLs taken from access
+  logs, which would be the way to catch size sets no longer discoverable on
+  disk.
 
 ### `quarantine`
 
@@ -328,12 +427,30 @@ cleanup:
   allowCrossDevice: false
   maxDeleteFraction: 0.98                  # abort above this orphan ratio, (0, 1]
 
+warm:
+  baseUrl: ""                              # empty = read core_config_data
+  cacheHashes: []                          # 32-char lowercase hex, repeatable
+  hashFile: ""                             # snapshot from cache clean --save-hashes
+  concurrency: 4
+  timeout: 30s                             # a duration string, not a number
+  method: get                              # get | head
+  userAgent: ""                            # empty = built-in default
+  maxRequests: 0                           # 0 = no limit
+  rate: 0                                  # 0 = no limit
+  maxErrorFraction: 0.05                   # range (0, 1]
+
 output:
   format: table                            # table | json | markdown
   language: en                             # en | zh
   verbose: 0
   quiet: false
 ```
+
+Note the two different spellings of a duration and a fraction: `warm.timeout` is
+a **duration string** (`30s`, `2m`), because a nanosecond count would be the kind
+of value nobody edits correctly, while `warm.maxErrorFraction` is a plain number.
+`warm.method` is the one value not validated here; the accepted values live in
+the warm package, and an unknown one is rejected before any request is issued.
 
 ### Precedence
 
@@ -465,6 +582,24 @@ To roll back after a complete purge there is no artefact — that is what makes
 
 Only where you ask for them, via `scan --output`. Nothing is written to
 `var/log` or anywhere else by the binary itself.
+
+### Hash snapshot
+
+Wherever you point `cache clean --save-hashes`. A comment header followed by one
+32-character size-set hash per line:
+
+```
+# mage-mediagc thumbnail cache hashes
+# One size-set hash per line, as found under media/catalog/product/cache/.
+# Written before the cache is emptied; read by `mage-mediagc cache warm`.
+0123456789abcdef0123456789abcdef
+fedcba9876543210fedcba9876543210
+```
+
+Blank lines and `#` comments are ignored when reading, and duplicate lines are
+collapsed, so the file can be edited by hand. It is a record of the size sets
+Magento was asked for, not a copy of anything: with it, `cache warm` knows what
+to request; without it, that has to be re-learned from traffic.
 
 ---
 

@@ -8,6 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
+
+	"github.com/shuaiZend/mage-mediagc/internal/config"
 )
 
 func newConfigCmd(a *app) *cobra.Command {
@@ -31,7 +33,7 @@ func newConfigShowCmd(a *app) *cobra.Command {
 		Use:   "show",
 		Short: "Print the resolved configuration (passwords redacted)",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := a.cfg.Validate(false); err != nil {
+			if err := a.cfg.Validate(config.ModeLocal); err != nil {
 				return err
 			}
 			if asYAML {
@@ -59,6 +61,16 @@ func newConfigShowCmd(a *app) *cobra.Command {
 			fmt.Fprintf(tw, "cross device\t%v\n", a.cfg.Cleanup.AllowCrossDevice)
 			fmt.Fprintf(tw, "orphan threshold\t%.2f\n", a.cfg.Cleanup.MaxDeleteFraction)
 			fmt.Fprintf(tw, "batch size\t%d\n", a.cfg.Cleanup.BatchSize)
+			fmt.Fprintf(tw, "warm base url\t%s\n", orNone(a.cfg.Warm.BaseURL))
+			fmt.Fprintf(tw, "warm size sets\t%d\n", len(a.cfg.Warm.CacheHashes))
+			fmt.Fprintf(tw, "warm hash file\t%s\n", orDash(a.cfg.Warm.HashFile))
+			fmt.Fprintf(tw, "warm concurrency\t%d\n", a.cfg.Warm.Concurrency)
+			fmt.Fprintf(tw, "warm timeout\t%s\n", a.cfg.Warm.Timeout.Std())
+			fmt.Fprintf(tw, "warm method\t%s\n", orNone(a.cfg.Warm.Method))
+			fmt.Fprintf(tw, "warm user agent\t%s\n", userAgentForDisplay(a.cfg.Warm.UserAgent))
+			fmt.Fprintf(tw, "warm max requests\t%d\n", a.cfg.Warm.MaxRequests)
+			fmt.Fprintf(tw, "warm rate\t%d\n", a.cfg.Warm.Rate)
+			fmt.Fprintf(tw, "warm error limit\t%.2f\n", a.cfg.Warm.MaxErrorFraction)
 			fmt.Fprintf(tw, "output format\t%s\n", a.cfg.Output.Format)
 			fmt.Fprintf(tw, "output language\t%s\n", a.cfg.Output.Language)
 			fmt.Fprintf(tw, "verbose\t%d\n", a.cfg.Output.Verbose)
@@ -93,6 +105,26 @@ func orDash(s string) string {
 		return "-"
 	}
 	return filepath.Clean(s)
+}
+
+// orNone is orDash for values that are not paths. filepath.Clean must not be
+// applied to a URL: it collapses the "//" in "https://shop.example.com" and
+// silently produces a hostless string.
+func orNone(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// userAgentForDisplay resolves the empty User-Agent setting into the value the
+// warm command would actually send, so that `config show` does not answer the
+// question "what will my traffic look like?" with a dash.
+func userAgentForDisplay(configured string) string {
+	if configured == "" {
+		return defaultUserAgent() + "  (built-in default)"
+	}
+	return configured
 }
 
 const configTemplate = `# mage-mediagc configuration
@@ -143,6 +175,48 @@ cleanup:
   allowCrossDevice: false
   # Abort quarantine when the orphan ratio exceeds this value (0-1].
   maxDeleteFraction: 0.98
+
+warm:
+  # Storefront URL the cache URLs are resolved against, e.g.
+  # https://shop.example.com (no trailing slash needed, no path prefix unless
+  # the store really is served from one). Leave empty to read
+  # web/secure/base_url, then web/unsecure/base_url, from core_config_data —
+  # which means the run needs database access. Setting it explicitly keeps
+  # cache warm usable on a host with no database at all.
+  #
+  # Point this at the origin, not at a CDN: a CDN that already holds the image
+  # will answer without the origin ever generating it.
+  baseUrl: ""
+  # Size sets to warm, as hex hashes. Leave empty: they are discovered from
+  # media/catalog/product/cache/ (or read from hashFile). Only set this to
+  # pin a specific set, for example to re-warm one after a theme change.
+  cacheHashes: []
+  # Snapshot of the size sets, written by "cache clean --save-hashes <file>"
+  # before the cache is emptied. After a clean, nothing on the host remembers
+  # which size sets the theme asks for, and discovery has nothing left to look
+  # at.
+  hashFile: ""
+  # Requests in flight. Keep it modest: every request makes the storefront
+  # resize an image on the same PHP workers that serve visitors.
+  concurrency: 4
+  # Timeout for one request.
+  timeout: 30s
+  # get downloads the variant, head asks for headers only. Prefer get: a proxy
+  # or CDN may answer a head from the edge without generating anything, which
+  # looks like success while writing no file.
+  method: get
+  # User-Agent header. Empty means a built-in default that names and versions
+  # the tool, so your traffic is identifiable in the shop's access log.
+  userAgent: ""
+  # Stop after this many requests in a single run (0 = no limit). Useful to
+  # warm a large catalog in slices, or to measure throughput before committing
+  # to the rest.
+  maxRequests: 0
+  # Cap on request starts per second across all workers (0 = no limit). The
+  # polite setting for a shop that is live and busy.
+  rate: 0
+  # Abort when the share of failed requests exceeds this (0-1].
+  maxErrorFraction: 0.05
 
 output:
   # table, json or markdown

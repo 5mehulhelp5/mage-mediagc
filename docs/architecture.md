@@ -125,6 +125,48 @@ Three operations, in increasing order of danger:
   absolute paths, `..` escapes and traversal are rejected per file, recorded as
   failures, and do not abort the run.
 
+### `internal/warm` — refilling what `cache clean` emptied
+
+This package is the odd one out: it neither reads the database nor writes to the
+media tree. It plans a set of HTTP requests — every original crossed with every
+size set — and issues them, letting Magento's own image pipeline do the writing.
+Warming is therefore not a privileged operation on the shop; it is what a
+visitor's browser would do, at scale, before anybody is waiting.
+
+Four decisions shape it.
+
+**The size-set hash is discovered, never computed.** Magento names each cache
+directory with an md5 of PHP-side parameters. Reproducing that in Go would mean
+reimplementing code that lives in a module the tool cannot see, and the failure
+mode is quiet: a wrong hash produces a URL space that does not exist, where every
+request returns 200 and generates nothing at all. So the hashes are read off the
+directory listing instead. That is also why `cache clean --save-hashes` exists —
+emptying the cache destroys the only local record of them.
+
+**Existence is checked with a local `stat`, not a request.** A skip costs
+nothing, which is what makes an interrupted run nearly free to resume and
+`--max-requests` a usable way to warm a large catalog in slices.
+
+**The run is proved on one request before it is allowed to make a hundred
+thousand.** A CDN or reverse proxy in front of the web server can answer from
+the edge, returning 200 without PHP ever running; without the check, the entire
+run looks successful and the cache stays empty. The probe is one request
+followed by an `os.Stat` of the file it should have produced, and a mismatch
+stops the run before any pool starts.
+
+**The rate cap and the failure-rate gate exist because the other end is
+somebody else's server.** Concurrency defaults to four rather than to the scan
+worker count, because every request spends the storefront's PHP workers. The
+gate turns "a large share of these requests failed" into a reported error rather
+than a number nobody reads — the usual causes being the wrong host and a WAF
+rejecting the client.
+
+Internally it is the same shape as `media.Scan`: a bounded job channel, a fixed
+pool, atomic counters, and cancellation taken from the context `Execute` derives
+from `SIGINT`. The differences are all about talking to a live storefront — a
+ticker for the rate cap, an `io.Copy(io.Discard)` of every body so connections
+are reused, and a `Transport` sized to the pool.
+
 ### `internal/report` and `internal/cli`
 
 Rendering is pure: `Payload` in, bytes out, in table, JSON or Markdown. The CLI
@@ -157,3 +199,8 @@ config itself means:
 - `db-clean` removes rows whose referenced product is missing. It does not
   rewrite `url_rewrite`, flat tables or search index tables; re-run Magento's
   own indexers afterwards, as the command output says.
+- `cache warm` cannot warm webp or CMYK variants, because Magento decides
+  whether to produce those from configuration this tool does not read. It also
+  cannot recover a size set that exists nowhere on disk and has not yet been
+  requested by anybody — after a `cache clean` with no hash snapshot, those come
+  back one request at a time, from traffic.

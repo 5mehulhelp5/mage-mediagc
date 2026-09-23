@@ -57,6 +57,7 @@ that can keep an image alive, and reports the difference. Cleaning is split
 into independently reversible stages:
 
   cache clean   drop the derived thumbnail cache        (zero risk, auto-rebuilt)
+  cache warm    refill it by requesting the cache URLs   (needs the storefront)
   quarantine    move orphaned originals to a holding dir (reversible)
   purge         delete the holding dir once verified     (frees space)
   db-clean      remove rows pointing at deleted products
@@ -121,6 +122,35 @@ func Execute() int {
 		return 1
 	}
 	return 0
+}
+
+// defaultUserAgent is the User-Agent the warm command sends when none is
+// configured.
+//
+// Naming and versioning the tool is not decoration. Warming a catalog means
+// sending hundreds of thousands of requests at somebody's storefront, and the
+// person who finds that traffic in their access log needs to be able to tell
+// what it was and where it came from without opening a ticket.
+//
+// It lives here rather than in the config defaults so that `config show` can
+// report the value that will actually be sent, without the format string being
+// written down twice.
+func defaultUserAgent() string {
+	return "mage-mediagc/" + version.Version + " (+https://github.com/shuaiZend/mage-mediagc)"
+}
+
+// resolveFlag picks between a flag value and the corresponding config value.
+//
+// A flag the user actually typed wins over the config file, which is the same
+// precedence loadConfig applies for the global flags. The test is "was the
+// flag changed" rather than "is the value non-zero", because zero is a
+// meaningful setting for several of them — rate 0 means unlimited, and
+// max-requests 0 means no limit.
+func resolveFlag[T any](cmd *cobra.Command, name string, flagVal, cfgVal T) T {
+	if cmd.Flags().Changed(name) {
+		return flagVal
+	}
+	return cfgVal
 }
 
 // loadConfig merges configuration sources, respecting which flags the user

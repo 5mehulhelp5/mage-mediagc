@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/shuaiZend/mage-mediagc/internal/config"
 	"github.com/shuaiZend/mage-mediagc/internal/magento"
 )
 
@@ -41,7 +42,7 @@ Without --apply nothing is deleted. Always run a backup first:
   mage-mediagc db-clean --apply --batch-size 5000`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-			if err := a.cfg.Validate(false); err != nil {
+			if err := a.cfg.Validate(config.ModeAnalyze); err != nil {
 				return err
 			}
 			client, err := a.openDB(ctx)

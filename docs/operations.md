@@ -6,7 +6,9 @@ each one produces the evidence needed to justify the next.
 ```
 1. measure  ──►  2. thumbnails  ──►  3. isolate  ──►  4. verify  ──►  5. free space
    scan            cache clean         quarantine        shop looks       purge
-                   --apply             --apply           right?
+                   --save-hashes       --apply           right?
+                   cache warm
+                   --apply
 
                                           │
                                           └──► rollback: restore --apply
@@ -44,17 +46,56 @@ loss.
 ## Stage 2 — Thumbnails (zero risk)
 
 ```sh
-mage-mediagc cache clean --apply
+# Empty it, recording the size sets before they are destroyed
+mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
+
+# Refill it. Dry run first: it costs the whole job without issuing anything.
+mage-mediagc cache warm --hash-file var/cache-hashes.txt
+mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
 ```
 
-Deletes `pub/media/catalog/product/cache` and recreates the directory with the
-original ownership. Magento regenerates each variant on first request.
+`cache clean` deletes `pub/media/catalog/product/cache` and recreates the
+directory with the original ownership. Magento regenerates each variant on first
+request, so nothing can be lost: no database row references these files by name.
 
-Expect a temporary CPU spike on the first day of traffic as variants rebuild.
-Nothing can be lost: no database row references these files by name.
+**Order matters when the shop has both problems.** The scan report lists
+`cache clean` first because it cannot lose anything, but on a shop with a large
+orphan population the cheaper order is `scan` → `quarantine` → `cache clean` →
+`cache warm`. The reason is regeneration: an orphan never comes back, while
+every cache file does, and cleaning before quarantining means generating
+thumbnails for images you are about to remove. `cache warm --live-only` buys the
+same saving on its own, at the cost of running the full reference analysis.
 
-This is the one destructive operation worth scheduling automatically. The
-package ships a daily timer for it.
+The `--save-hashes` file is the part that is easy to leave out and expensive to
+regret. Size sets are Magento's own md5 directory names, derived from
+configuration rather than stored anywhere; after the tree is gone there is
+nothing on the host to discover them from, and `cache warm` can only pick up the
+ones the first visitors happen to request.
+
+`cache warm` pays the regeneration cost up front and concurrently instead of
+putting it on the first visitor. Three properties make it safe against a live
+shop:
+
+- variants that already exist are skipped with a local `stat`, so an interrupted
+  run resumes for free and re-running re-generates nothing;
+- one request is made first, and its cache file checked for — a run where
+  requests return 200 and no file appears stops immediately, which is what a CDN
+  or reverse proxy answering from the edge looks like;
+- the request rate is capped by `warm.concurrency` and, if you want, `--rate`.
+
+Watch it and keep the default four workers until you have measured:
+
+```sh
+mage-mediagc cache warm --hash-file var/cache-hashes.txt --max-requests 500 --apply
+```
+
+The duration it reports is your throughput. On a busy shop, prefetch during the
+quiet hours and use `--rate` rather than a large `--concurrency`.
+
+This is the one destructive operation worth scheduling automatically — the
+package ships a daily timer for `cache clean`. If you enable `cache warm` on a
+schedule, write `--save-hashes` to a path that survives the clean, or the warm
+run will have nothing to read.
 
 ---
 
@@ -325,6 +366,7 @@ server with SSD storage. They are orders of magnitude, not benchmarks:
 | --- | --- | --- |
 | `scan` | ~1.2M files, ~130 GB | ~2–4 minutes |
 | `cache clean` | ~800k files, ~35 GB | ~1–2 minutes |
+| `cache warm` | ~800k variants | hours; see below |
 | `quarantine` | ~370k files, ~84 GB | ~1–3 minutes |
 | `restore` | ~370k files | ~1–3 minutes |
 | `db-clean` | ~1.9M rows | ~5–15 minutes |
@@ -333,3 +375,21 @@ server with SSD storage. They are orders of magnitude, not benchmarks:
 `scan.workers` to the spindle count on mechanical storage and to the core count
 on SSD. The file operations are metadata-only and are dominated by directory
 lookups, so high `cleanup.parallel` values help.
+
+`cache warm` is the exception in this table: its cost is not this machine's but
+the storefront's, because every request makes PHP decode, resize and re-encode
+an image. It is also the only operation where throughput is limited by something
+you should be reluctant to maximise — the workers serving your visitors. Measure
+before scaling:
+
+```sh
+mage-mediagc cache warm --hash-file var/cache-hashes.txt --max-requests 500 --apply
+```
+
+Four workers against a healthy shop typically lands in the low tens of requests
+per second, which puts a million-variant rebuild in the tens of hours. Raising
+`--concurrency` shortens that until the shop's response times degrade, and that
+is the number to find, not the largest one that runs without errors. `--rate` is
+the safer control on a shop that must stay responsive, and warming only the
+images that are still referenced (`--live-only`) can cut the job substantially
+on a catalog with many orphans.

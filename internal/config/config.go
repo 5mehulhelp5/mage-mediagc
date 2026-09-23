@@ -94,6 +94,47 @@ type Cleanup struct {
 	MaxDeleteFraction float64 `yaml:"maxDeleteFraction"`
 }
 
+// Warm tunes the thumbnail-cache warm-up stage, which refills the derived
+// cache by requesting the cached image URLs through the storefront.
+//
+// Nothing here is read by the analysis commands; a shop can warm its cache
+// without knowing anything about orphans, and can find orphans without ever
+// pointing the tool at the web server.
+type Warm struct {
+	// BaseURL is the storefront URL the cache URLs are resolved against.
+	// Empty means "read web/secure/base_url (then web/unsecure/base_url) from
+	// core_config_data", which needs database access.
+	BaseURL string `yaml:"baseUrl"`
+	// CacheHashes pins the size sets to warm. Normally they are discovered
+	// from the cache directory, or read back from HashFile, so this only
+	// exists for pinning a specific set by hand.
+	CacheHashes []string `yaml:"cacheHashes"`
+	// HashFile is a snapshot of the size sets, written by
+	// `cache clean --save-hashes` before the tree is emptied. It is what
+	// survives the gap between emptying the cache and refilling it.
+	HashFile string `yaml:"hashFile"`
+	// Concurrency is the number of requests in flight.
+	Concurrency int `yaml:"concurrency"`
+	// Timeout bounds a single request.
+	Timeout Duration `yaml:"timeout"`
+	// Method is "get" or "head"; empty means "get". Prefer get: a caching
+	// proxy can answer a head from the edge without generating anything.
+	Method string `yaml:"method"`
+	// UserAgent is sent with every request. Empty means the built-in default,
+	// which names and versions the tool so that whoever sees the traffic in
+	// their logs can tell what it is.
+	UserAgent string `yaml:"userAgent"`
+	// MaxRequests stops a run after this many requests, so a large catalog can
+	// be warmed in slices (0 = no limit).
+	MaxRequests int `yaml:"maxRequests"`
+	// Rate caps request starts per second across all workers (0 = no limit).
+	Rate int `yaml:"rate"`
+	// MaxErrorFraction aborts the run's verdict when the share of failed
+	// requests exceeds it (0-1]. A run that mostly fails is evidence that the
+	// tool is talking to the wrong host, not that the shop is broken.
+	MaxErrorFraction float64 `yaml:"maxErrorFraction"`
+}
+
 // Output tunes reporting.
 type Output struct {
 	Format   OutputFormat `yaml:"format"`
@@ -108,6 +149,7 @@ type Config struct {
 	DB      DB      `yaml:"database"`
 	Scan    Scan    `yaml:"scan"`
 	Cleanup Cleanup `yaml:"cleanup"`
+	Warm    Warm    `yaml:"warm"`
 	Output  Output  `yaml:"output"`
 
 	// ConfigFile records where the YAML came from, for provenance in reports.
@@ -132,6 +174,20 @@ func Default() *Config {
 			BatchSize:         1000,
 			Parallel:          defaultWorkers(),
 			MaxDeleteFraction: 0.98,
+		},
+		Warm: Warm{
+			// Four is deliberately well below the scan worker count. Warming
+			// spends the storefront's PHP workers, which are the same ones
+			// serving visitors, so the ceiling that matters is not this
+			// machine's CPU. Callers raise it once they have measured.
+			Concurrency: 4,
+			Timeout:     Duration(30 * time.Second),
+			// Spelled out rather than left empty even though warm.ParseMethod
+			// treats "" as get. A literal here cannot drift silently: the
+			// accepted values live in internal/warm, and anything it does not
+			// recognize fails before the first request is issued.
+			Method:           "get",
+			MaxErrorFraction: 0.05,
 		},
 		Output: Output{
 			Format:   FormatTable,
@@ -193,9 +249,63 @@ func (d DB) dsn(redact bool) string {
 	return c.FormatDSN()
 }
 
+// ValidateMode names the parts of the configuration that a command will
+// actually use, so that a command which cannot touch one of them is not
+// blocked by the gap.
+//
+// This matters because the natural time to discover that the database settings
+// are wrong is before you have run anything, and the natural tool is
+// `config show` — which does not need a database at all. Filesystem-only
+// commands are in the same position: `cache clean` on a web host that cannot
+// reach MySQL is a reasonable thing to want, and the credentials have nothing
+// to do with whether it can delete a directory.
+type ValidateMode struct {
+	// Database requires the MySQL connection settings.
+	Database bool
+	// Write requires the paths that operations modifying the media tree need.
+	Write bool
+}
+
+// The three kinds of command the CLI has, named so call sites read as intent.
+var (
+	// ModeAnalyze is for commands that read the database and the media tree.
+	ModeAnalyze = ValidateMode{Database: true}
+	// ModeWrite is for commands that also modify the media tree.
+	ModeWrite = ValidateMode{Database: true, Write: true}
+	// ModeLocal is for commands that only touch the filesystem.
+	ModeLocal = ValidateMode{}
+)
+
+// databaseProblems lists the settings that a connection needs, so that the
+// wording lives in one place whether it is Validate or a command that decides
+// to connect partway through asking for it.
+func (c *Config) databaseProblems() []string {
+	var problems []string
+	if c.DB.Name == "" {
+		problems = append(problems, "database name is required (--db-name or database.name)")
+	}
+	if c.DB.User == "" {
+		problems = append(problems, "database user is required (--db-user or database.user)")
+	}
+	return problems
+}
+
+// RequireDatabase reports the missing database settings as an error.
+//
+// It is exported for commands that connect conditionally: `cache warm` reads
+// the storefront base URL from the database only when --base-url was not
+// given, so it asks for these settings at the point it decides to connect
+// rather than up front.
+func (c *Config) RequireDatabase() error {
+	if problems := c.databaseProblems(); len(problems) > 0 {
+		return errors.New("invalid configuration:\n  - " + strings.Join(problems, "\n  - "))
+	}
+	return nil
+}
+
 // Validate reports configuration problems that would fail later, in a way
 // that is easier to act on up front.
-func (c *Config) Validate(forWrite bool) error {
+func (c *Config) Validate(mode ValidateMode) error {
 	var problems []string
 
 	if c.Magento.MediaPath == "" && c.Magento.Root == "" {
@@ -203,11 +313,8 @@ func (c *Config) Validate(forWrite bool) error {
 			"(run from the Magento root, pass --magento-root/--media-path, "+
 			"or set magento.root in the config file)")
 	}
-	if c.DB.Name == "" {
-		problems = append(problems, "database name is required (--db-name or database.name)")
-	}
-	if c.DB.User == "" {
-		problems = append(problems, "database user is required (--db-user or database.user)")
+	if mode.Database {
+		problems = append(problems, c.databaseProblems()...)
 	}
 	switch c.Output.Format {
 	case FormatTable, FormatJSON, FormatMarkdown:
@@ -239,7 +346,32 @@ func (c *Config) Validate(forWrite bool) error {
 			"cleanup.maxDeleteFraction must be in (0, 1], got %g", c.Cleanup.MaxDeleteFraction))
 	}
 
-	if forWrite {
+	// The warm settings are checked here even though most commands never read
+	// them: a typo in the config file should be reported by whichever command
+	// runs first, not hours later by the one that finally warms the cache.
+	//
+	// warm.method is intentionally not validated here. Its accepted values
+	// live in internal/warm, and duplicating the list would let the two drift
+	// apart silently; the warm run rejects an unknown method before it issues
+	// a single request.
+	if c.Warm.Concurrency < 1 {
+		problems = append(problems, "warm.concurrency must be >= 1")
+	}
+	if c.Warm.Timeout.Std() <= 0 {
+		problems = append(problems, `warm.timeout must be positive (for example "30s")`)
+	}
+	if c.Warm.MaxErrorFraction <= 0 || c.Warm.MaxErrorFraction > 1 {
+		problems = append(problems, fmt.Sprintf(
+			"warm.maxErrorFraction must be in (0, 1], got %g", c.Warm.MaxErrorFraction))
+	}
+	if c.Warm.MaxRequests < 0 {
+		problems = append(problems, "warm.maxRequests must be >= 0")
+	}
+	if c.Warm.Rate < 0 {
+		problems = append(problems, "warm.rate must be >= 0")
+	}
+
+	if mode.Write {
 		if c.Cleanup.QuarantineDir == "" {
 			problems = append(problems, "quarantine directory could not be derived; pass --quarantine-dir")
 		}

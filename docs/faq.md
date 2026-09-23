@@ -10,6 +10,12 @@ at any time, including during peak traffic.
 `cache clean` is safe in practice — the files are derived data that Magento
 regenerates on first request — but expect a slowdown until the cache warms.
 
+`cache warm` issues the requests that make Magento regenerate those files, so it
+puts load on the storefront. It never touches an original image, and everything
+it creates is derived data that `cache clean` would delete again. Keep
+`warm.concurrency` at its default until you have measured the shop's tolerance;
+`--rate` is the polite control on a busy site.
+
 `quarantine`, `restore` and `purge` touch original images. `quarantine` only
 moves files and is fully reversible; `purge` is permanent. Neither runs without
 `--apply`.
@@ -165,6 +171,51 @@ Do not run two mutating operations simultaneously. Concurrent scans are fine, bu
 two `quarantine` runs would race on the manifest, and `quarantine` racing
 `purge` could delete files another run just moved.
 
+`cache warm` is the exception: two runs against the same cache are merely
+wasteful, not dangerous. Both request the same URLs, Magento generates the same
+files, and the worst outcome is duplicate work — so a large rebuild can be split
+across hosts, each with its own `--max-requests` slice or a different subset of
+`--cache-hash` values.
+
+### Does `cache warm` need database access?
+
+Only sometimes, and never for the thing you would expect. Neither `cache stats`
+nor `cache clean` nor `config show` connects at all, and `cache warm` skips the
+database when the base URL is given explicitly:
+
+```sh
+mage-mediagc cache warm --base-url https://shop.example.com --apply
+```
+
+Without `--base-url` the command reads `web/secure/base_url` from
+`core_config_data`; `--live-only` runs the full reference analysis. Both need
+the connection. Everything else about warming is HTTP and filesystem work, which
+is why it can run from a laptop or a CI job against a shop it has no route to.
+
+### Why does `cache warm` say the file was not created?
+
+Because the request succeeded without the origin generating anything — almost
+always a CDN, a Varnish layer or a reverse proxy answering from the edge.
+Magento never ran, no cache file appeared, and the rest of the run would have
+looked like a success while filling nothing. That is why the pre-flight request
+exists, and why the run stops rather than continuing.
+
+Point `--base-url` at the origin. If you have confirmed the URL mapping by hand
+and a manual request really does write the file, `--no-probe` skips the check.
+
+### Which size sets does `cache warm` fill?
+
+The ones it can see: the size-set directories present under
+`media/catalog/product/cache/` (or listed in a `--hash-file` snapshot). It
+requests exactly the URLs Magento would serve for those sets, so the files it
+produces are the same files a visitor's request would produce.
+
+Two kinds of variant are deliberately left out. webp and CMYK variants, because
+Magento decides whether to produce them from configuration this tool does not
+read. And a size set that no longer exists on disk anywhere — after a clean with
+no snapshot, those are re-learned one request at a time, from traffic. Warming
+shortens the cold period; it does not remove it.
+
 ### It refused to start with "invalid configuration". Why?
 
 The configuration is validated up front, and all problems are reported at once.
@@ -172,9 +223,13 @@ The usual causes:
 
 - not run from the Magento root, and no `--magento-root` or `--media-path`
   given, so neither could be discovered;
-- no database name or user, because `app/etc/env.php` was not found;
+- no database name or user, because `app/etc/env.php` was not found — note that
+  this is only required by commands that actually connect, so `scan`, `list`,
+  `quarantine`, `verify` and `db-clean` are the ones that care; `cache stats`,
+  `cache clean`, `config show` and `cache warm --base-url …` run without it;
 - a typo in `output.format` (`markdown`, not `md`) or `output.language`;
-- `cleanup.maxDeleteFraction` outside `(0, 1]`.
+- `cleanup.maxDeleteFraction` outside `(0, 1]`, or `warm.concurrency` below 1,
+  `warm.timeout` at zero, or `warm.maxErrorFraction` outside `(0, 1]`.
 
 `mage-mediagc config show` prints what was actually resolved and where the config
 file came from, which usually answers this immediately.

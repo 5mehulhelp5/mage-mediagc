@@ -152,6 +152,66 @@ func (c *Client) ColumnExists(ctx context.Context, table, column string) (bool, 
 	return n > 0, nil
 }
 
+// BaseURL resolves the storefront base URL from core_config_data.
+//
+// The secure value wins over the unsecure one when both are set, because the
+// warm run has to talk to the URL the shop actually serves visitors from, and
+// that is the one whose path the web server maps to pub/media.
+//
+// No store context is available to a command-line tool, so the default-scope
+// row is preferred and a website- or store-scoped override is used only when
+// there is no default at all. A shop whose storefront lives on a store-scoped
+// URL therefore has to pass --base-url, which the error says.
+func (c *Client) BaseURL(ctx context.Context) (string, error) {
+	table := c.Table("core_config_data")
+	ok, err := c.TableExists(ctx, "core_config_data")
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("%s does not exist: pass --base-url", table)
+	}
+
+	q := "SELECT path, value, scope FROM `" + table + "` WHERE path IN (?, ?)"
+	rows, err := c.db.QueryContext(ctx, q, "web/secure/base_url", "web/unsecure/base_url")
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var secure, unsecure string
+	for rows.Next() {
+		var path, value, scope string
+		if err := rows.Scan(&path, &value, &scope); err != nil {
+			return "", err
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		switch path {
+		case "web/secure/base_url":
+			if secure == "" || scope == "default" {
+				secure = value
+			}
+		case "web/unsecure/base_url":
+			if unsecure == "" || scope == "default" {
+				unsecure = value
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if secure != "" {
+		return secure, nil
+	}
+	if unsecure != "" {
+		return unsecure, nil
+	}
+	return "", fmt.Errorf("no base URL configured in %s: pass --base-url", table)
+}
+
 func placeholders(n int) string {
 	if n <= 0 {
 		return ""

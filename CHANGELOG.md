@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cache warm`** — refill Magento's derived thumbnail cache by requesting the
+  cache URLs through the storefront. Every original is paired with every size
+  set the theme uses, and Magento generates each missing variant through the
+  same code path a visitor's browser would take. Nothing has to be installed on
+  the shop: no PHP runtime, no `bin/magento`, no Composer, no module. It needs
+  HTTP access and nothing else, so it runs from a laptop, a bastion host or a
+  CI job against a shop it has no shell on.
+
+  This addresses the cost `cache clean` defers onto the first visitors. The
+  alternative, `bin/magento catalog:images:resize`, is single-threaded,
+  re-resizes variants that already exist and cannot be interrupted; `cache warm`
+  skips what exists with a local `stat` and issues the rest concurrently, so an
+  interrupted run resumes for free.
+
+  Three details matter for safety against a live shop. Size-set hashes are
+  **discovered** from the cache directory rather than computed — Magento derives
+  them from PHP-side parameters, and a wrong hash means requesting a URL space
+  that does not exist, where every request returns 200 and generates nothing.
+  One request is issued first, on its own, with its cache file checked for
+  afterwards: a run where requests succeed and no file appears stops
+  immediately, which is what a CDN or reverse proxy answering from the edge
+  looks like. And the failure rate is gated at `warm.maxErrorFraction`, so a
+  wrong host or a hostile WAF is reported rather than hammered.
+
+  New flags: `--base-url`, `--cache-hash`, `--hash-file`, `--concurrency`,
+  `--timeout`, `--method`, `--user-agent`, `--rate`, `--max-requests`,
+  `--max-error-fraction`, `--live-only`, `--no-probe`, and `--apply`. New
+  configuration section `warm`, documented in `docs/reference.md` and
+  `docs/configuration.md`, and included in `config template` and
+  `examples/mage-mediagc.yaml`.
+- **`cache clean --save-hashes <path>`** — record the size-set hashes to a file
+  before the cache is emptied. Emptying the tree destroys the only local record
+  of which size sets the theme asks for, so without this snapshot a later
+  `cache warm --hash-file` has nothing to read and the size sets have to be
+  re-learned from traffic.
+- `internal/warm`, and the `mage-mediagc cache warm` command surface.
+
+### Changed
+
+- **Filesystem-only commands no longer require database credentials.**
+  `cache stats`, `cache clean`, `config show` and `cache warm` with an explicit
+  `--base-url` never connect to MySQL, but the shared configuration validation
+  demanded a database name and user for every command, so they refused to start
+  without one. Validation is now scoped to what a command actually uses
+  (`ModeAnalyze`, `ModeWrite`, `ModeLocal`), which also means `config show`
+  works on the machine where the database *is* the thing that is misconfigured —
+  the case it exists for. Commands that do connect still report a missing name
+  or user in the same words, at the same point.
+- The `scan` report's recommended first step now shows `cache clean --apply
+  --save-hashes var/cache-hashes.txt` and names the follow-up
+  `cache warm --hash-file`, because the previous text recommended the one action
+  that discards what a rebuild needs to know.
+- `docs/operations.md` explains the ordering trade-off between `quarantine` and
+  `cache clean`: an orphan never comes back, while every cache file does, so
+  quarantining first avoids generating thumbnails for images about to be
+  removed.
+
+### Fixed
+
+- **The shipped configuration files made every command refuse to start.**
+  `mage-mediagc config template` and `examples/mage-mediagc.yaml` both set
+  `scan.workers: 0` and `cleanup.parallel: 0`, under comments saying zero means
+  "auto" — which is what `--workers 0` means everywhere else, and what the
+  defaults use. Validation, however, rejected any count below one, so copying
+  the file the README points at produced a configuration that failed before the
+  user had changed a single line. Zero is now resolved to the CPU-derived
+  default while configuration is loaded, and a negative count is still reported.
+  Two tests cover it: one on the resolution itself, and one that loads both
+  shipped files and validates them in analyze and write mode, so a config the
+  project recommends cannot silently stop working again.
+
 ## [0.2.1] - 2026-09-23
 
 ### Fixed

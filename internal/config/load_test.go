@@ -375,13 +375,13 @@ func TestValidate(t *testing.T) {
 	good.Magento.MediaPath = t.TempDir()
 	good.DB.Name = "db"
 	good.DB.User = "user"
-	if err := good.Validate(false); err != nil {
+	if err := good.Validate(ModeAnalyze); err != nil {
 		t.Fatalf("expected a valid config, got %v", err)
 	}
 
 	noDB := Default()
 	noDB.Magento.MediaPath = t.TempDir()
-	if err := noDB.Validate(false); err == nil {
+	if err := noDB.Validate(ModeAnalyze); err == nil {
 		t.Fatal("expected an error when the database is unset")
 	}
 
@@ -389,14 +389,66 @@ func TestValidate(t *testing.T) {
 	badFormat.Magento.MediaPath = t.TempDir()
 	badFormat.DB.Name, badFormat.DB.User = "d", "u"
 	badFormat.Output.Format = "xml"
-	if err := badFormat.Validate(false); err == nil {
+	if err := badFormat.Validate(ModeAnalyze); err == nil {
 		t.Fatal("expected an error for an unsupported format")
 	}
 
 	noMedia := Default()
 	noMedia.DB.Name, noMedia.DB.User = "d", "u"
-	if err := noMedia.Validate(false); err == nil {
+	if err := noMedia.Validate(ModeAnalyze); err == nil {
 		t.Fatal("expected an error when no media path or root is known")
+	}
+}
+
+// A command that only touches the filesystem has no business demanding
+// database credentials. cache clean and config show are the tools an operator
+// reaches for on a web host that cannot reach MySQL, and refusing to run
+// without credentials would make the diagnosis impossible.
+func TestValidateLocalDoesNotRequireADatabase(t *testing.T) {
+	cfg := Default()
+	cfg.Magento.MediaPath = t.TempDir()
+
+	if err := cfg.Validate(ModeLocal); err != nil {
+		t.Fatalf("filesystem-only validation must not require the database: %v", err)
+	}
+	// The same config is still refused when a command really will connect, so
+	// the relaxation is scoped to the commands that need it.
+	if err := cfg.Validate(ModeAnalyze); err == nil {
+		t.Fatal("analyze mode must still require database settings")
+	}
+	if err := cfg.RequireDatabase(); err == nil {
+		t.Fatal("RequireDatabase must report the missing name and user")
+	} else if !strings.Contains(err.Error(), "database name is required") ||
+		!strings.Contains(err.Error(), "database user is required") {
+		t.Fatalf("RequireDatabase should name both missing settings, got: %v", err)
+	}
+}
+
+func TestValidateRejectsBadWarmSettings(t *testing.T) {
+	cases := map[string]func(*Config){
+		"concurrency":      func(c *Config) { c.Warm.Concurrency = 0 },
+		"timeout":          func(c *Config) { c.Warm.Timeout = 0 },
+		"maxErrorFraction": func(c *Config) { c.Warm.MaxErrorFraction = 1.5 },
+		"maxRequests":      func(c *Config) { c.Warm.MaxRequests = -1 },
+		"rate":             func(c *Config) { c.Warm.Rate = -1 },
+	}
+	for name, corrupt := range cases {
+		cfg := Default()
+		cfg.Magento.MediaPath = t.TempDir()
+		cfg.DB.Name, cfg.DB.User = "d", "u"
+		corrupt(cfg)
+		if err := cfg.Validate(ModeAnalyze); err == nil {
+			t.Errorf("expected warm.%s to be rejected", name)
+		}
+	}
+
+	// The built-in warm defaults have to survive their own validation, which
+	// is what makes an unmodified config file usable.
+	fresh := Default()
+	fresh.Magento.MediaPath = t.TempDir()
+	fresh.DB.Name, fresh.DB.User = "d", "u"
+	if err := fresh.Validate(ModeAnalyze); err != nil {
+		t.Fatalf("the built-in warm defaults must validate: %v", err)
 	}
 }
 
@@ -405,7 +457,7 @@ func TestValidateForWriteRequiresExistingMediaPath(t *testing.T) {
 	cfg.Magento.MediaPath = filepath.Join(t.TempDir(), "does-not-exist")
 	cfg.DB.Name, cfg.DB.User = "d", "u"
 	cfg.Cleanup.QuarantineDir = "/tmp/q"
-	if err := cfg.Validate(true); err == nil {
+	if err := cfg.Validate(ModeWrite); err == nil {
 		t.Fatal("expected an error for a missing media path in write mode")
 	}
 }
@@ -510,8 +562,39 @@ func TestDefaultWorkersIsSane(t *testing.T) {
 	// The defaults are only required to be valid once the shop is known.
 	cfg.Magento.MediaPath = t.TempDir()
 	cfg.DB.Name, cfg.DB.User = "shop", "shopuser"
-	if err := cfg.Validate(false); err != nil {
+	if err := cfg.Validate(ModeAnalyze); err != nil {
 		t.Fatalf("the built-in defaults must validate once a shop is known: %v", err)
+	}
+}
+
+// Zero means "auto" for the worker counts, wherever the zero came from. The
+// shipped template and example config both write it deliberately, so a zero
+// that survived loading was a config that no command would start from.
+func TestZeroWorkerCountsResolveToAuto(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mage-mediagc.yaml")
+	body := "scan:\n  workers: 0\ncleanup:\n  parallel: 0\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(Overrides{ConfigFile: path})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Scan.Workers < 1 {
+		t.Errorf("scan.workers = %d, want the auto value", cfg.Scan.Workers)
+	}
+	if cfg.Cleanup.Parallel < 1 {
+		t.Errorf("cleanup.parallel = %d, want the auto value", cfg.Cleanup.Parallel)
+	}
+
+	// A negative count is a mistake rather than a request for auto, and must
+	// still be reported.
+	cfg.Scan.Workers = -1
+	cfg.Magento.MediaPath = t.TempDir()
+	cfg.DB.Name, cfg.DB.User = "d", "u"
+	if err := cfg.Validate(ModeAnalyze); err == nil {
+		t.Fatal("expected a negative worker count to be rejected")
 	}
 }
 
@@ -521,7 +604,7 @@ func TestValidateRejectsOutOfRangeDeleteFraction(t *testing.T) {
 		cfg.Magento.MediaPath = t.TempDir()
 		cfg.DB.Name, cfg.DB.User = "d", "u"
 		cfg.Cleanup.MaxDeleteFraction = bad
-		if err := cfg.Validate(false); err == nil {
+		if err := cfg.Validate(ModeAnalyze); err == nil {
 			t.Errorf("expected cleanup.maxDeleteFraction=%g to be rejected", bad)
 		}
 	}

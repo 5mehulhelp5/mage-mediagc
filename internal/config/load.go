@@ -99,6 +99,24 @@ func Load(ov Overrides) (*Config, error) {
 	// 4) Command-line overrides have the final word.
 	applyOverrides(cfg, ov)
 
+	// 5) Resolve the worker counts that were left at zero.
+	//
+	// Zero means "auto" everywhere it is documented — in `--workers`, in
+	// `scan.workers`, in `cleanup.parallel`, and in the shipped config template
+	// and examples, both of which write `0` on purpose. Without this, copying
+	// the example produced a config that every command then refused to start
+	// from, because validation rejects a count below one.
+	//
+	// It runs here rather than in Default because a zero can arrive from any of
+	// the five sources; it runs before validation because that is the only way
+	// it can be told apart from a negative value somebody typed by mistake.
+	if cfg.Scan.Workers == 0 {
+		cfg.Scan.Workers = defaultWorkers()
+	}
+	if cfg.Cleanup.Parallel == 0 {
+		cfg.Cleanup.Parallel = defaultWorkers()
+	}
+
 	cfg.DerivePaths()
 	return cfg, nil
 }

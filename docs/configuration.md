@@ -98,6 +98,18 @@ cleanup:
   allowCrossDevice: false           # permit a cross-filesystem move (a copy)
   maxDeleteFraction: 0.98           # abort above this orphan ratio
 
+warm:
+  baseUrl: ""                       # default from core_config_data
+  cacheHashes: []                   # pin size sets by hand
+  hashFile: ""                      # snapshot written by cache clean --save-hashes
+  concurrency: 4                    # requests in flight
+  timeout: 30s                      # per request
+  method: get                       # get | head
+  userAgent: ""                     # default names and versions the tool
+  maxRequests: 0                    # 0 = no limit
+  rate: 0                           # 0 = no limit
+  maxErrorFraction: 0.05            # fail above this failure share
+
 output:
   format: table                     # table | json | markdown
   verbose: 0
@@ -140,6 +152,49 @@ rotten shop while still catching a broken run.
 short and replication lag predictable. 1000 is a reasonable default; drop to
 200 on a busy shop with a lagging replica.
 
+**`warm.baseUrl`** — the storefront URL that `cache warm` resolves cache URLs
+against. Left empty, it is read from `web/secure/base_url`, falling back to
+`web/unsecure/base_url`, in `core_config_data` — which means that run needs
+database access. Setting it explicitly is what makes `cache warm` usable on a
+host with no database at all:
+
+```sh
+mage-mediagc cache warm --base-url https://shop.example.com --apply
+```
+
+Point it at the origin rather than at a CDN. An edge that already holds the
+images answers the requests itself, and the cache stays empty while every
+request reports success; `cache warm`'s pre-flight check exists to catch exactly
+that, and the error says so.
+
+**`warm.concurrency`** (default `4`) — how many requests are in flight. This is
+deliberately lower than `scan.workers`: every request makes the shop resize an
+image on the same PHP workers that serve visitors, so the limit that matters is
+the storefront's spare capacity, not this machine's CPU. Raise it once you have
+measured — `--max-requests 500` plus the reported duration is a cheap way to
+find the throughput the shop will tolerate.
+
+**`warm.hashFile`** — the snapshot `cache clean --save-hashes` writes and
+`cache warm --hash-file` reads. It holds the size-set hashes, which nothing on
+the host can reconstruct afterwards: they are derived from the theme's
+`view.xml` through Magento's own code, and after the cache is emptied there is
+nothing left to discover them from.
+
+```sh
+mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
+mage-mediagc cache warm  --hash-file var/cache-hashes.txt --apply
+```
+
+**`warm.rate`** and **`warm.maxRequests`** — the two throttles, both `0` for
+unlimited. `rate` caps request starts per second across all workers and is the
+polite setting for a shop that is live and busy; `maxRequests` bounds one run so
+a large catalog can be warmed in slices without redoing finished work.
+
+**`warm.maxErrorFraction`** (default `0.05`) — a run reports failure when more
+than this share of its requests did not return 2xx. A run that mostly fails is
+evidence that the tool is talking to the wrong host, or that a WAF is rejecting
+its user agent, rather than that the shop is broken.
+
 **`output.verbose`** — `0` summary, `1` per-reference-source detail (use this
 when the orphan ratio looks wrong), `2` includes the orphan and missing file
 lists in the report.
@@ -165,6 +220,20 @@ GRANT SELECT ON shop_prod.* TO 'magegc_ro'@'localhost';
 ```sh
 mage-mediagc scan --db-user magegc_ro --db-password '...'
 ```
+
+### A host that cannot reach the database at all
+
+The filesystem-only commands never connect, and do not require credentials:
+`cache stats`, `cache clean`, `config show`, and `cache warm` when
+`--base-url` is given explicitly.
+
+```sh
+mage-mediagc cache warm --base-url https://shop.example.com --apply
+```
+
+That is the shape of a warm run from a laptop, a bastion host or a CI job
+against a shop whose database it has no route to. (`--live-only` is the
+exception: it runs the reference analysis, so it needs the connection.)
 
 ### Replica, with the analysis following the primary's media
 

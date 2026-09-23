@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/shuaiZend/mage-mediagc/internal/analyzer"
+	"github.com/shuaiZend/mage-mediagc/internal/config"
 	"github.com/shuaiZend/mage-mediagc/internal/magento"
 	"github.com/shuaiZend/mage-mediagc/internal/media"
 )
@@ -21,7 +22,7 @@ type analyzeOptions struct {
 // Reference statistics are not returned separately: the analyzer already
 // copies them into Result.RefStats for reporting.
 func (a *app) runAnalysis(ctx context.Context, opts analyzeOptions) (*analyzer.Result, *magento.Client, error) {
-	if err := a.cfg.Validate(false); err != nil {
+	if err := a.cfg.Validate(config.ModeAnalyze); err != nil {
 		return nil, nil, err
 	}
 
@@ -29,7 +30,22 @@ func (a *app) runAnalysis(ctx context.Context, opts analyzeOptions) (*analyzer.R
 	if err != nil {
 		return nil, nil, err
 	}
+	res, err := a.analyzeWith(ctx, client, opts)
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, err
+	}
+	return res, client, nil
+}
 
+// analyzeWith runs reference collection, the media scan and the comparison
+// against an already open client.
+//
+// It is split out from runAnalysis because a command can need the connection
+// for something else as well — `cache warm` reads the storefront base URL from
+// it — and opening a second pool for that would be wasteful and would double
+// the number of connections the shop's database sees.
+func (a *app) analyzeWith(ctx context.Context, client *magento.Client, opts analyzeOptions) (*analyzer.Result, error) {
 	if opts.showProgress {
 		fmt.Fprintln(a.stderr, "collecting database references...")
 	}
@@ -37,8 +53,7 @@ func (a *app) runAnalysis(ctx context.Context, opts analyzeOptions) (*analyzer.R
 		IncludeContentRefs: a.cfg.Scan.IncludeContentRefs,
 	})
 	if err != nil {
-		_ = client.Close()
-		return nil, nil, fmt.Errorf("collect references: %w", err)
+		return nil, fmt.Errorf("collect references: %w", err)
 	}
 	if opts.showProgress {
 		fmt.Fprintf(a.stderr, "  %d distinct reference paths from %d sources\n", refs.Len(), len(refs.Stats))
@@ -57,19 +72,13 @@ func (a *app) runAnalysis(ctx context.Context, opts analyzeOptions) (*analyzer.R
 		Progress:     scanProgress,
 	})
 	if err != nil {
-		_ = client.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	if opts.showProgress {
 		fmt.Fprintf(a.stderr, "\r  indexed %d files (%s)\n", len(scan.Files), media.HumanBytes(scan.Bytes))
 	}
 
-	res, err := analyzer.Analyze(ctx, scan, refs, analyzer.DefaultOptions())
-	if err != nil {
-		_ = client.Close()
-		return nil, nil, err
-	}
-	return res, client, nil
+	return analyzer.Analyze(ctx, scan, refs, analyzer.DefaultOptions())
 }
 
 // targetInfo builds the report header for the resolved configuration.

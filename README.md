@@ -84,6 +84,7 @@ protects `catalog/product/placeholder/` outright.
 | --- | --- | --- | --- |
 | Report | `scan` | none, read-only | n/a |
 | Clear thumbnails | `cache clean --apply` | none, Magento regenerates them | n/a |
+| Refill thumbnails | `cache warm --apply` | none, but the load lands on the storefront | n/a |
 | Isolate orphans | `quarantine --apply` | files moved, originals intact | `restore --apply` |
 | Free the space | `purge --apply` | **permanent** | no |
 | Remove stale rows | `db-clean --apply` | **permanent** | restore from backup |
@@ -232,6 +233,7 @@ self-contained document with numbered next steps.
 | `scan` | Index the media tree, collect references, report the difference |
 | `list --kind orphan\|live\|missing` | Print individual paths |
 | `cache stats` / `cache clean --apply` | Measure or clear the thumbnail cache |
+| `cache warm --apply` | Refill the thumbnail cache by requesting the derived URLs |
 | `quarantine --apply` | Move orphans into the holding directory |
 | `restore --apply` | Put quarantined files back |
 | `purge --apply` | Delete the holding directory (refuses one it did not create) |
@@ -242,6 +244,72 @@ self-contained document with numbered next steps.
 
 Every mutating command is a dry run unless `--apply` is given. Full flag
 reference: [docs/reference.md](docs/reference.md).
+
+## Refilling the thumbnail cache
+
+Magento stores every resized variant under
+`catalog/product/cache/<md5(size params)>/…` and generates one the first time
+somebody asks for it. Emptying that tree is the safest large win available —
+15–30% of media on a mature catalog — and the cost is paid by the first
+visitors, who wait for PHP to resize images on the request path.
+
+`cache warm` moves that cost off them. It pairs every original with every size
+set the theme uses and requests the derived URLs through the storefront, so
+Magento generates each variant through exactly the code path a visitor's browser
+would take. Nothing is installed on the shop: no PHP runtime, no `bin/magento`,
+no Composer, no module. The tool needs HTTP access and nothing else, so it runs
+from a laptop, a bastion host or a CI job against a shop it has no shell on.
+
+```sh
+# Empty the cache, recording which size sets exist before they are destroyed
+mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
+
+# Refill it: a dry run to see the size of the job, then the real thing
+mage-mediagc cache warm --hash-file var/cache-hashes.txt
+mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
+```
+
+The hashes are the whole trick. Magento names each size-set directory with an md5
+of private PHP-side parameters, so the tool **discovers** them from the cache
+directory rather than computing them — and that only works while the cache still
+holds them. `--hash-file` is how that knowledge survives the gap between
+emptying the cache and refilling it. Without a snapshot, the size sets are
+whatever the first visitors happen to ask for.
+
+Two things make it safe against a live shop. Variants that already exist are
+skipped with a local `stat`, so an interrupted run resumes almost free and
+re-running never re-generates anything. And one request is issued first, on its
+own, with its cache file checked for afterwards: a run where requests return 200
+and no file appears stops right there, because that is what a CDN or reverse
+proxy answering from the edge looks like.
+
+It is also the better answer to "just run `php bin/magento
+catalog:images:resize`". That command is single-threaded, re-resizes variants
+that already exist and cannot be interrupted; `cache warm` skips what exists and
+does the rest concurrently, across several workers.
+
+| Flag | Purpose |
+| --- | --- |
+| `--apply` | Issue the requests. Without it, only the plan is reported. |
+| `--base-url` | Storefront URL. Defaults to `web/secure/base_url` from `core_config_data`. |
+| `--hash-file` | Read the size sets from a snapshot. |
+| `--cache-hash` | Pin one size set, repeatable. |
+| `--concurrency` | Requests in flight (default 4). |
+| `--rate` | Cap request starts per second, for a shop that is busy. |
+| `--max-requests` | Stop after N requests, to warm a large catalog in slices. |
+| `--live-only` | Warm only images that are still referenced (needs the database). |
+| `--no-probe` | Skip the pre-flight check, once you have verified the URL mapping by hand. |
+
+Four limits are worth knowing before relying on it. It needs the storefront
+reachable **at the origin**, not through a CDN that already holds the images. It
+does not warm webp or CMYK variants, because Magento decides whether to produce
+those from configuration this tool does not read. `--live-only`, and the default
+base-URL lookup, need database access — passing `--base-url` explicitly is what
+makes the command usable with no database at all. And after a `cache clean` with
+no snapshot, the size sets have to be re-learned from traffic.
+
+Full flag reference, including the pre-flight check in detail:
+[docs/reference.md](docs/reference.md).
 
 ## Configuration
 
@@ -306,6 +374,10 @@ procedure: [docs/deployment.md](docs/deployment.md) and
 
 - **Read before write.** `scan`, `list`, `cache stats`, `config show` and
   `verify` cannot modify anything.
+- **Refilling the cache writes only derived files.** `cache warm` sends HTTP
+  requests to the storefront and lets Magento generate variants through its own
+  code path. It never touches an original, and everything it creates is what
+  `cache clean` would delete again.
 - **Dry run by default.** Every destructive command requires `--apply`.
 - **Move, never delete.** Orphans are renamed into a quarantine directory, with
   a JSONL manifest recording every path, so `restore` is exact.
@@ -338,6 +410,7 @@ procedure: [docs/deployment.md](docs/deployment.md) and
 │   ├── media/                parallel media-tree scan
 │   ├── analyzer/             live/orphan classification and statistics
 │   ├── action/               cache clean, quarantine, restore, purge
+│   ├── warm/                 thumbnail cache warm-up over HTTP
 │   ├── report/               table / JSON / Markdown rendering
 │   └── cli/                  cobra command surface
 ├── internal/integration/     end-to-end tests against real MySQL
@@ -393,7 +466,10 @@ values.
 - A Magento 2 installation (tested against 2.2, 2.3 and 2.4 schemas) or any
   `magento_*`-shaped database
 - MySQL 5.7+ or MariaDB 10.2+ reachable with read/write access for
-  `db-clean`; read-only is enough for everything else
+  `db-clean`; read-only is enough for everything else. Not every command needs
+  it at all: `cache stats`, `cache clean`, `config show` and `cache warm
+  --base-url …` never connect, so they run on a host with no route to the
+  database
 - No PHP on the host, no `bin/magento`, no Composer
 - A Unix-like host. Binaries are published for Linux and macOS only: the safety
   guarantees rest on POSIX device numbers and file ownership, and the steps that

@@ -79,6 +79,56 @@ cleanup:
   # garbage, so the guard is worth keeping below 1. Range: (0, 1].
   maxDeleteFraction: 0.98
 
+warm:
+  # Storefront URL that `cache warm` resolves the derived image URLs against.
+  # Left empty it is read from core_config_data (web/secure/base_url, then
+  # web/unsecure/base_url), which requires database access. Setting it here or
+  # passing --base-url is what lets a warm run work on a host with no database.
+  #
+  # Point it at the origin, not at a CDN: an edge that already holds the images
+  # answers without the origin generating anything, and the cache stays empty
+  # while every request reports success.
+  baseUrl: ""
+
+  # Size sets to warm, as 32-character hex hashes. Leave empty. They are
+  # discovered from media/catalog/product/cache/, or read from hashFile, and
+  # computing them is not possible outside Magento's own PHP code.
+  cacheHashes: []
+
+  # Snapshot of the size sets, written by `cache clean --save-hashes` before the
+  # cache is emptied. After a clean, nothing on the host remembers which size
+  # sets the theme asks for, so this file is the only thing that can tell a
+  # later run what to request.
+  hashFile: ""
+
+  # Requests in flight. Deliberately lower than scan.workers: every request
+  # makes the shop resize an image on the same PHP workers that serve visitors.
+  # Raise it once you have measured the shop's tolerance with --max-requests.
+  concurrency: 4
+
+  # Timeout for one request.
+  timeout: 30s
+
+  # get downloads the variant; head asks for headers only. Prefer get: a proxy
+  # or CDN may answer a head from the edge without generating anything.
+  method: get
+
+  # User-Agent header. Empty means a built-in default that names and versions
+  # the tool, so this traffic is identifiable in the shop's access log.
+  userAgent: ""
+
+  # Stop after this many requests in one run. 0 means no limit. Useful to warm
+  # a large catalog in slices: variants that already exist are skipped without
+  # a request, so a later run continues where this one stopped.
+  maxRequests: 0
+
+  # Cap on request starts per second across all workers. 0 means no limit. The
+  # polite setting for a shop that is live and busy.
+  rate: 0
+
+  # Fail the run when the share of non-2xx responses exceeds this. Range (0, 1].
+  maxErrorFraction: 0.05
+
 output:
   # table | json | markdown
   format: table

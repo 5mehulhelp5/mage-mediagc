@@ -105,12 +105,27 @@ scheduled, and only because it cannot lose data: the thumbnail cache is derived
 data, Magento regenerates each variant on first request, and nothing references
 those files by name. The cost of an unnecessary run is a little CPU.
 
+The unit deliberately passes no `--save-hashes`. A shop busy enough to warrant a
+daily timer has enough traffic to relearn its size sets immediately, so there is
+nothing to rebuild ahead of time. On a quiet shop, or when you want a clean to
+be followed by a warm rather than by the first visitor, run the pair by hand:
+
+```sh
+mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
+mage-mediagc cache warm  --hash-file var/cache-hashes.txt --apply
+```
+
 ### Deliberately not scheduled
 
 `quarantine`, `purge` and `db-clean` have no units. They are permanent or
 high-consequence, and the whole point of the report is that somebody reads it
 first. Automating them is possible — write your own unit and gate it on the
 report — but it is not something this project will do for you.
+
+`cache warm` has no unit either, for a different reason: it is harmless but
+expensive, and its cost is paid by the storefront rather than by this machine.
+Any unit for it should be gated on `warm.rate` and run outside trading hours,
+which is a decision only the shop's operators can make.
 
 ### Site-specific settings
 
