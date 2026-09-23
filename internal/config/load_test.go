@@ -69,6 +69,148 @@ func TestLoadEnvPHPMissingFile(t *testing.T) {
 	}
 }
 
+// writeEnvPHPBody writes an arbitrary env.php, for fixtures that only differ in
+// one field.
+func writeEnvPHPBody(t *testing.T, body string) string {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "app", "etc")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "env.php"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// envPHPWithPort builds an env.php whose only interesting field is `port`.
+func envPHPWithPort(portLiteral string) string {
+	return `<?php
+return [
+    'db' => [
+        'connection' => [
+            'default' => [
+                'host' => 'localhost',
+                'port' => ` + portLiteral + `,
+                'dbname' => 'shop',
+            ],
+        ],
+    ],
+];
+`
+}
+
+// Magento writes the port as a quoted string. A bare type assertion used to drop
+// it, leaving the operator silently on the default port.
+func TestLoadEnvPHPReadsQuotedPort(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		portValue string
+		want      int
+	}{
+		{"quoted", "'3309'", 3309},
+		{"unquoted", "3309", 3309},
+		{"float", "3309.0", 3309},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeEnvPHPBody(t, envPHPWithPort(tc.portValue))
+			env, err := LoadEnvPHP(root)
+			if err != nil {
+				t.Fatalf("LoadEnvPHP: %v", err)
+			}
+			if env.DBPort != tc.want {
+				t.Errorf("DBPort = %d, want %d", env.DBPort, tc.want)
+			}
+		})
+	}
+}
+
+// An explicit port wins over one embedded in the host.
+func TestLoadEnvPHPPortOverridesHostPort(t *testing.T) {
+	root := writeEnvPHPBody(t, `<?php
+return [
+    'db' => [
+        'connection' => [
+            'default' => [
+                'host' => 'db.internal:3307',
+                'port' => '3310',
+                'dbname' => 'shop',
+            ],
+        ],
+    ],
+];
+`)
+	env, err := LoadEnvPHP(root)
+	if err != nil {
+		t.Fatalf("LoadEnvPHP: %v", err)
+	}
+	if env.DBHost != "db.internal" || env.DBPort != 3310 {
+		t.Errorf("got %s:%d, want db.internal:3310", env.DBHost, env.DBPort)
+	}
+}
+
+// A port outside 1-65535 is a configuration error, not something to fall back
+// from silently. 4294967296 is 2^32, which a narrowing conversion would turn
+// into 0 -- the value this package reads as "no port configured".
+func TestLoadEnvPHPRejectsOutOfRangePort(t *testing.T) {
+	for _, tc := range []struct{ name, portValue string }{
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"too large", "99999"},
+		{"wraps a 32-bit int", "4294967296"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := writeEnvPHPBody(t, envPHPWithPort(tc.portValue))
+			if _, err := LoadEnvPHP(root); err == nil {
+				t.Fatalf("expected an error for port %s", tc.portValue)
+			}
+		})
+	}
+}
+
+// A port the parser cannot read at all is not an error: the host-derived port or
+// the default still applies.
+func TestLoadEnvPHPIgnoresUnreadablePort(t *testing.T) {
+	root := writeEnvPHPBody(t, `<?php
+return [
+    'db' => [
+        'connection' => [
+            'default' => [
+                'host' => 'db.internal:3307',
+                'port' => 'not-a-port',
+                'dbname' => 'shop',
+            ],
+        ],
+    ],
+];
+`)
+	env, err := LoadEnvPHP(root)
+	if err != nil {
+		t.Fatalf("LoadEnvPHP: %v", err)
+	}
+	if env.DBHost != "db.internal" || env.DBPort != 3307 {
+		t.Errorf("got %s:%d, want db.internal:3307", env.DBHost, env.DBPort)
+	}
+}
+
+func TestLoadEnvPHPRejectsOutOfRangePortInHost(t *testing.T) {
+	for _, host := range []string{"db.internal:99999", "db.internal:-1"} {
+		root := writeEnvPHPBody(t, `<?php
+return [
+    'db' => [
+        'connection' => [
+            'default' => ['host' => '`+host+`', 'dbname' => 'shop'],
+        ],
+    ],
+];
+`)
+		if _, err := LoadEnvPHP(root); err == nil {
+			t.Errorf("expected an error for host %q", host)
+		}
+	}
+}
+
 func TestDetectMagentoRootWalksUp(t *testing.T) {
 	root := t.TempDir()
 	writeEnvPHP(t, root)

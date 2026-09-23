@@ -67,11 +67,31 @@ func LoadEnvPHP(magentoRoot string) (*EnvPHP, error) {
 	}
 
 	host, _ := selected["host"].(string)
-	host, port := splitHostPort(host)
+	host, hostPort := splitHostPort(host)
 	out.DBHost = host
-	out.DBPort = port
+	if hostPort < 0 || hostPort > 65535 {
+		return out, fmt.Errorf(
+			"%s: db.connection.host %q carries an out-of-range port %d",
+			path, host, hostPort)
+	}
+	out.DBPort = hostPort
 
-	if v, ok := selected["port"].(int64); ok && v > 0 {
+	// Magento writes this value both as an integer and as a quoted string, so go
+	// through the helper that accepts either. A bare `.(int64)` assertion silently
+	// dropped the quoted form, which left the operator on the default port with no
+	// indication that their configured port had been ignored.
+	//
+	// The range check is what keeps the narrowing conversion honest. The value
+	// comes from a file we do not control, and on a platform where int is narrower
+	// than int64 an unchecked conversion wraps: 4294967296 becomes 0, which this
+	// package reads as "no port configured". A TCP port is 16 bits, so the bounds
+	// are constants rather than a property of the host.
+	if v, ok := phpconfig.GetInt(selected, "port"); ok {
+		if v < 1 || v > 65535 {
+			return out, fmt.Errorf(
+				"%s: db.connection.port is %d, which is not a valid TCP port (1-65535)",
+				path, v)
+		}
 		out.DBPort = int(v)
 	}
 	out.DBName, _ = selected["dbname"].(string)

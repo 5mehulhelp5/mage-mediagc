@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The database port in `app/etc/env.php` is read through the helper that accepts
+  every numeric form. It was read with a bare type assertion, so a port written
+  as a quoted string — which is what Magento writes — or as a float was silently
+  ignored and the operator was left on the default port.
+- An out-of-range port is now reported instead of quietly falling back. The
+  conversion to `int` was also unchecked, which CodeQL flags as
+  `go/incorrect-integer-conversion`: on a platform where `int` is narrower than
+  `int64`, a value like `4294967296` wraps to `0`, which this package reads as
+  "no port configured". A TCP port is 16 bits, so the bound is a constant pair.
+  The same range is enforced on a port embedded in the `host` field.
+
 ## [0.2.0] - 2026-09-23
 
 ### Changed
