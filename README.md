@@ -253,12 +253,17 @@ somebody asks for it. Emptying that tree is the safest large win available —
 15–30% of media on a mature catalog — and the cost is paid by the first
 visitors, who wait for PHP to resize images on the request path.
 
-`cache warm` moves that cost off them. It pairs every original with every size
-set the theme uses and requests the derived URLs through the storefront, so
-Magento generates each variant through exactly the code path a visitor's browser
-would take. Nothing is installed on the shop: no PHP runtime, no `bin/magento`,
-no Composer, no module. The tool needs HTTP access and nothing else, so it runs
-from a laptop, a bastion host or a CI job against a shop it has no shell on.
+`cache warm` moves that cost off them. It requests one cache URL per original
+image, and Magento generates each variant through exactly the code path a
+visitor's browser would take. Nothing is installed on the shop: no PHP runtime,
+no `bin/magento`, no Composer, no module. The tool needs HTTP access and nothing
+else, so it runs from a laptop, a bastion host or a CI job against a shop it has
+no shell on.
+
+It requests one URL per image, not per variant, because since Magento 2.3 a
+single request regenerates that image's variant in every size set the theme
+defines — twenty-five of them on a stock theme. A 60,000-image catalog is 60,000
+requests, not 1.5 million.
 
 ```sh
 # Empty the cache, recording which size sets exist before they are destroyed
@@ -269,19 +274,22 @@ mage-mediagc cache warm --hash-file var/cache-hashes.txt
 mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
 ```
 
-The hashes are the whole trick. Magento names each size-set directory with an md5
-of private PHP-side parameters, so the tool **discovers** them from the cache
-directory rather than computing them — and that only works while the cache still
-holds them. `--hash-file` is how that knowledge survives the gap between
-emptying the cache and refilling it. Without a snapshot, the size sets are
-whatever the first visitors happen to ask for.
+A request has to name a size set in its path, and Magento names those
+directories with an md5 of private PHP-side parameters built from the theme's
+`view.xml` and from store configuration. The tool **discovers** one rather than
+computing it: from the cache tree, from a `--hash-file` snapshot, or — when both
+are empty — by asking the shop once and reading the answer off the disk. Only one
+is needed, since the request regenerates the rest, but it has to be one the theme
+currently asks for, and a stale value is detected and replaced.
 
-Two things make it safe against a live shop. Variants that already exist are
-skipped with a local `stat`, so an interrupted run resumes almost free and
-re-running never re-generates anything. And one request is issued first, on its
-own, with its cache file checked for afterwards: a run where requests return 200
-and no file appears stops right there, because that is what a CDN or reverse
-proxy answering from the edge looks like.
+Three things make it safe against a live shop. Images that already have a
+variant are skipped with a local `stat`, so an interrupted run resumes almost
+free and re-running never re-generates anything. One request is issued first, on
+its own, with its cache file checked for afterwards: a run where requests return
+200 and no file appears stops right there, because that is what a CDN or reverse
+proxy answering from the edge looks like. And Magento 2.2 and earlier are refused
+outright — they generate nothing on request, so the run would be wasted — with
+the check pointing at `bin/magento catalog:images:resize` instead.
 
 It is also the better answer to "just run `php bin/magento
 catalog:images:resize`". That command is single-threaded, re-resizes variants
@@ -292,8 +300,12 @@ does the rest concurrently, across several workers.
 | --- | --- |
 | `--apply` | Issue the requests. Without it, only the plan is reported. |
 | `--base-url` | Storefront URL. Defaults to `web/secure/base_url` from `core_config_data`. |
-| `--hash-file` | Read the size sets from a snapshot. |
-| `--cache-hash` | Pin one size set, repeatable. |
+| `--hash-file` | Read the size set from a snapshot. |
+| `--cache-hash` | Route the requests through one size set. |
+| `--loopback` | Dial `127.0.0.1` while keeping the Host header, for a run on the shop's own server. |
+| `--resolve` | Replace the address dialed for one host and port. |
+| `--insecure-skip-verify` | Accept a self-signed certificate, which Go otherwise rejects for having no SAN. |
+| `--skip-support-check` | Warm anyway on an install that looks like Magento 2.2. |
 | `--concurrency` | Requests in flight (default 4). |
 | `--rate` | Cap request starts per second, for a shop that is busy. |
 | `--max-requests` | Stop after N requests, to warm a large catalog in slices. |

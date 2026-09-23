@@ -10,12 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`cache warm`** — refill Magento's derived thumbnail cache by requesting the
-  cache URLs through the storefront. Every original is paired with every size
-  set the theme uses, and Magento generates each missing variant through the
-  same code path a visitor's browser would take. Nothing has to be installed on
-  the shop: no PHP runtime, no `bin/magento`, no Composer, no module. It needs
-  HTTP access and nothing else, so it runs from a laptop, a bastion host or a
-  CI job against a shop it has no shell on.
+  cache URLs through the storefront. Magento generates each missing variant
+  through the same code path a visitor's browser would take. Nothing has to be
+  installed on the shop: no PHP runtime, no `bin/magento`, no Composer, no
+  module. It needs HTTP access and nothing else, so it runs from a laptop, a
+  bastion host or a CI job against a shop it has no shell on.
 
   This addresses the cost `cache clean` defers onto the first visitors. The
   alternative, `bin/magento catalog:images:resize`, is single-threaded,
@@ -23,27 +22,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skips what exists with a local `stat` and issues the rest concurrently, so an
   interrupted run resumes for free.
 
-  Three details matter for safety against a live shop. Size-set hashes are
-  **discovered** from the cache directory rather than computed — Magento derives
-  them from PHP-side parameters, and a wrong hash means requesting a URL space
-  that does not exist, where every request returns 200 and generates nothing.
-  One request is issued first, on its own, with its cache file checked for
-  afterwards: a run where requests succeed and no file appears stops
-  immediately, which is what a CDN or reverse proxy answering from the edge
-  looks like. And the failure rate is gated at `warm.maxErrorFraction`, so a
-  wrong host or a hostile WAF is reported rather than hammered.
+  **One request per original, not per variant.** Since Magento 2.3 a request for
+  one cached URL regenerates that image's variant in *every* size set the theme
+  defines — twenty-five of them on a stock Ultimo theme — so the job is as large
+  as the catalog rather than as large as the URL space. Measured on a 2.3.7
+  install: 3 requests produced 75 variants (3 images × 25 sets), a warm hit costs
+  0.25 ms and a miss 0.85 s.
 
-  New flags: `--base-url`, `--cache-hash`, `--hash-file`, `--concurrency`,
+  Two properties of that code path decided the design, both confirmed against a
+  live shop rather than inferred. The hash segment in the URL is **not
+  validated** — any 32 hex characters reach the resize service — but the path
+  asked for is only created when the hash names a size set the theme really
+  asks for, so a made-up value warms the whole family while leaving the URL that
+  was requested absent. That is why the set is discovered from the cache tree,
+  or read from `--hash-file`, or **recovered with one request**: when the tree is
+  empty and nothing was supplied, the run asks the shop once and reads the answer
+  off the disk. A supplied value is then confirmed against the tree, so a stale
+  one left behind by an earlier theme or store configuration is corrected and
+  reported instead of silently wasting the run. `Magento\Catalog\Model\Product\
+  Image\ParamsBuilder` builds the hash inputs and `View\Asset\Image::getMiscPath`
+  hashes them, from `view.xml` *and* store configuration; the transform differs
+  between 2.2 and 2.3 (`convertToReadableFormat` does not exist before 2.3), so
+  sets are never portable between those releases.
+
+  **Magento 2.2 and earlier are refused**, because they generate nothing on
+  request: `Media::launch` only copies the file out of the media storage backend.
+  The check looks for `vendor/magento/module-media-storage/Service/ImageResize.php`
+  — the version boundary stated in code rather than in a version string — and
+  stops before the media tree is walked, so the operator gets the real cause
+  instead of the 404s the probe would have reported. `--skip-support-check`
+  overrides it.
+
+  **Reaching a shop on its own server.** `--loopback` dials `127.0.0.1` while
+  keeping the request's Host header and TLS server name, so the web server still
+  routes it to the right site. It costs no external bandwidth, needs no working
+  DNS for the shop's own domain, and unlike an `/etc/hosts` entry it does not
+  silently send every request to whichever vhost the server treats as default.
+  `--resolve host:port:address` replaces one address explicitly, and
+  `--insecure-skip-verify` accepts a self-signed certificate — which is needed
+  more often than it sounds, because Go rejects a certificate that carries only
+  a Common Name and no subject alternative name no matter who trusts it, and the
+  run says so in its output when verification is off. An address override also
+  disables the environment's `HTTP_PROXY`, since a proxy would otherwise carry
+  the request off the machine without saying so.
+
+  Image files whose path is not two directories and a file name are **excluded
+  and counted**: Magento recovers the original from the last three segments of
+  the request path (`Media::getOriginalImage`), so at any other depth the request
+  would resolve to a different image and quietly generate that one. Magento's own
+  layout is always this shape, so the rule costs nothing in practice.
+
+  New flags: `--base-url`, `--cache-hash`, `--hash-file`, `--loopback`,
+  `--resolve`, `--insecure-skip-verify`, `--skip-support-check`, `--concurrency`,
   `--timeout`, `--method`, `--user-agent`, `--rate`, `--max-requests`,
   `--max-error-fraction`, `--live-only`, `--no-probe`, and `--apply`. New
   configuration section `warm`, documented in `docs/reference.md` and
   `docs/configuration.md`, and included in `config template` and
   `examples/mage-mediagc.yaml`.
-- **`cache clean --save-hashes <path>`** — record the size-set hashes to a file
-  before the cache is emptied. Emptying the tree destroys the only local record
-  of which size sets the theme asks for, so without this snapshot a later
-  `cache warm --hash-file` has nothing to read and the size sets have to be
-  re-learned from traffic.
+- **`cache clean --save-hashes <path>`** — record the size sets to a file before
+  the cache is emptied. The tree is the cheapest place to read them from, so a
+  snapshot saves the one request a cold start would otherwise spend recovering
+  one. It is a shortcut rather than a requirement: a warm run that starts from an
+  empty tree asks the shop once and carries on.
 - `internal/warm`, and the `mage-mediagc cache warm` command surface.
 
 ### Changed
@@ -60,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `scan` report's recommended first step now shows `cache clean --apply
   --save-hashes var/cache-hashes.txt` and names the follow-up
   `cache warm --hash-file`, because the previous text recommended the one action
-  that discards what a rebuild needs to know.
+  that discards what a rebuild needs to know. The snapshot is described as the
+  shortcut it now is, rather than as the only record of the theme's size sets.
 - `docs/operations.md` explains the ordering trade-off between `quarantine` and
   `cache clean`: an orphan never comes back, while every cache file does, so
   quarantining first avoids generating thumbnails for images about to be

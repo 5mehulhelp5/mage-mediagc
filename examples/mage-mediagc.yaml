@@ -90,16 +90,40 @@ warm:
   # while every request reports success.
   baseUrl: ""
 
-  # Size sets to warm, as 32-character hex hashes. Leave empty. They are
-  # discovered from media/catalog/product/cache/, or read from hashFile, and
-  # computing them is not possible outside Magento's own PHP code.
-  cacheHashes: []
+  # Size set to route the requests through, as a 32-character hex hash. Leave
+  # empty: it is read from media/catalog/product/cache/, or recovered with one
+  # request when the tree is empty. Computing it is not possible outside
+  # Magento's own PHP code, and it does not need to be.
+  #
+  # Any set the theme still asks for will do — Magento regenerates every size
+  # set on a single request, whatever hash was asked for — but a set it has
+  # stopped asking for leaves the requested path absent, so a stale value is
+  # corrected at runtime and reported.
+  cacheHash: ""
 
   # Snapshot of the size sets, written by `cache clean --save-hashes` before the
-  # cache is emptied. After a clean, nothing on the host remembers which size
-  # sets the theme asks for, so this file is the only thing that can tell a
-  # later run what to request.
+  # cache is emptied. Saves the one request a cold start would spend recovering
+  # a live set. Optional.
   hashFile: ""
+
+  # Send the traffic to 127.0.0.1 instead of the address the storefront's domain
+  # resolves to, keeping the Host header and the TLS server name, so the web
+  # server still routes it to the right site. Set this when the tool runs on the
+  # shop's own server: no external bandwidth, no DNS dependency, and — unlike an
+  # /etc/hosts entry — no risk of silently reaching the wrong vhost on a host
+  # that serves several shops.
+  loopback: false
+
+  # Replace the address dialed for one host and port, as "host:port:address".
+  # Only needed where loopback is not enough. Repeatable.
+  resolve: []
+
+  # Accept any TLS certificate. Needed for a shop whose https certificate is
+  # self-signed for an internal name, which carries no subject alternative name
+  # and is therefore rejected outright by Go. Reported in the run's output,
+  # because the run can then no longer tell the shop from anything else
+  # answering on that address.
+  insecureSkipVerify: false
 
   # Requests in flight. Deliberately lower than scan.workers: every request
   # makes the shop resize an image on the same PHP workers that serve visitors.

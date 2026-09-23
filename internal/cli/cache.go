@@ -2,6 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"net"
+	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -84,11 +87,11 @@ that slowdown is to ask for everything in advance:
   mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
   mage-mediagc cache warm  --hash-file var/cache-hashes.txt --apply
 
---save-hashes records the size-set hashes present in the tree before it is
-emptied. Nothing on the host remembers them afterwards: they are derived from
-the theme's view.xml rather than stored, and once the tree is gone there is
-nothing left to discover them from. Without the snapshot, cache warm has to
-wait for the first visitors to reveal each size set, one variant at a time.
+--save-hashes records the size sets present in the tree before it is emptied.
+The tree is the cheapest place to read them from, so keeping a copy means
+cache warm does not have to spend a request recovering one. It is a shortcut
+rather than a requirement: a warm run that starts from an empty tree asks the
+shop once, and carries on from there.
 
 Reach for this rather than bin/magento catalog:images:resize, which is
 single-threaded, re-resizes variants that already exist and cannot be
@@ -143,8 +146,8 @@ written.`,
 					fmt.Fprintf(a.stdout, "Refill it up front with:\n  mage-mediagc cache warm --hash-file %s --apply\n",
 						saveHashes)
 				} else {
-					fmt.Fprintf(a.stdout, "Nothing recorded which size sets existed, so cache warm can only pick them\n")
-					fmt.Fprintf(a.stdout, "up from the first visitors' requests.\n")
+					fmt.Fprintf(a.stdout, "Nothing recorded which size sets existed, so cache warm will ask the shop\n")
+					fmt.Fprintf(a.stdout, "for one before it starts.\n")
 				}
 			} else if res.RemovedFiles > 0 {
 				fmt.Fprintf(a.stdout, "\nrun again with --apply to perform the cleanup\n")
@@ -154,7 +157,7 @@ written.`,
 	}
 	cmd.Flags().BoolVar(&apply, "apply", false, "perform the deletion (default is a dry run)")
 	cmd.Flags().StringVar(&saveHashes, "save-hashes", "",
-		"record the size-set hashes to this file before deleting, for `cache warm --hash-file`")
+		"record the size sets to this file before deleting, for `cache warm --hash-file`")
 	return cmd
 }
 
@@ -162,7 +165,7 @@ func newCacheWarmCmd(a *app) *cobra.Command {
 	var (
 		apply            bool
 		baseURL          string
-		hashes           []string
+		cacheHash        string
 		hashFile         string
 		concurrency      int
 		timeout          time.Duration
@@ -173,6 +176,10 @@ func newCacheWarmCmd(a *app) *cobra.Command {
 		maxErrorFraction float64
 		liveOnly         bool
 		noProbe          bool
+		loopback         bool
+		resolve          []string
+		insecure         bool
+		skipSupportCheck bool
 	)
 	cmd := &cobra.Command{
 		Use:   "warm",
@@ -186,28 +193,60 @@ Composer, no module. The tool needs HTTP access to the storefront and nothing
 else, so it can run from a laptop, a bastion host or a CI job against a shop
 it has no shell on.
 
-What gets requested
-  Every original image is paired with every size set the theme asks for. A
-  size set is identified by the md5 hash Magento uses as its cache directory
-  name, and those are discovered from media/catalog/product/cache/, or read
-  back from a snapshot (see below), or supplied with --cache-hash. The hash is
-  never computed: it is derived from PHP-side parameters, and guessing wrong
-  would mean requesting a URL space that does not exist, where every request
-  returns 200 and generates nothing at all.
+One request per original
+  Since Magento 2.3, a single request for one cached URL regenerates that
+  image's variant in every size set the theme defines. The run therefore
+  issues one request per original image, not one per variant — twenty-five
+  times less traffic than the URL space suggests. Variants that already
+  exist are skipped with a local stat rather than a request, so an interrupted
+  run resumes for almost nothing: run it again and it finds only what is
+  still missing.
 
-  Variants that already exist are skipped with a local stat rather than a
-  request, so an interrupted run resumes for almost nothing: run it again and
-  it finds only what is still missing.
+Magento 2.2 and earlier are refused
+  Those releases generate nothing on request, so every URL warm would ask for
+  fails. The check looks for the resize service under vendor/ rather than at a
+  version string, and stops before the media tree is walked. Override with
+  --skip-support-check once you have confirmed otherwise by hand.
 
-Emptying the cache destroys this knowledge
-  The hashes can only be discovered while the cache still holds them:
+Reaching the storefront without leaving the machine
+  On the shop's own server, sending the traffic out to the public address and
+  back costs bandwidth and depends on DNS. --loopback dials 127.0.0.1 while
+  keeping the request's Host header and TLS server name, so the web server
+  still routes it to the right site:
+
+    mage-mediagc cache warm --loopback --apply
+
+  That is also what makes the command usable on a host serving several shops.
+  The usual workaround — pointing the domain at 127.0.0.1 in /etc/hosts —
+  sends every request to whichever vhost the server treats as the default,
+  and does so silently, because the default vhost answers perfectly well.
+  --resolve host:port:address overrides one host and port when loopback is not
+  enough. If that shop's certificate is self-signed for an internal name, and
+  therefore carries no subject alternative name, Go refuses it outright —
+  --insecure-skip-verify accepts it, and the run says so in its output.
+
+Which size set the requests are routed through
+  A request names a size set in its path, and the set has to be one the theme
+  asks for, or the path that was asked for is never created. Which one does
+  not matter — a request regenerates every set either way, and the hash itself
+  cannot be computed outside PHP. So it is taken from --cache-hash, from
+  warm.cacheHash, from --hash-file, or read off the cache tree; and when the
+  tree is empty and nothing was supplied, one request is issued to make the
+  shop reveal the sets it uses.
+
+  The value is then confirmed against the tree, so a stale one left behind by
+  an earlier theme or store configuration is corrected instead of quietly
+  wasting the run. Sizes are derived from both, so editing either orphans
+  every existing size-set directory forever.
+
+Emptying the cache destroys the shortcut
+  The tree is the cheapest place to read the size sets from, so a snapshot
+  saves the one request a cold start costs:
 
     mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
     mage-mediagc cache warm  --hash-file var/cache-hashes.txt --apply
 
-  Without a snapshot, warm picks up whatever the first visitor happens to
-  request and the rest is generated lazily, which is the behavior you were
-  trying to avoid.
+  Without one, warm recovers a set on its own.
 
 Safety rails
   - one request is issued first, on its own, and the expected cache file is
@@ -219,6 +258,10 @@ Safety rails
   - the run fails when more than --max-error-fraction of the requests did not
     return 2xx, which usually means the wrong host or a WAF rejecting the
     client
+  - image files whose path is not two directories and a file name are excluded
+    and counted. Magento recovers the original from the last three path
+    segments, so at any other depth the request would resolve to a different
+    image and quietly generate that one instead
   - without --apply nothing is requested
 
 --live-only needs database access: it runs the usual reference analysis and
@@ -228,6 +271,9 @@ by default.`,
 		Example: `  # See the size of the job first, then do it
   mage-mediagc cache warm
   mage-mediagc cache warm --apply
+
+  # On the web server itself, without leaving the machine
+  mage-mediagc cache warm --loopback --apply
 
   # Refill after an intended clean
   mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
@@ -250,39 +296,14 @@ by default.`,
 			}
 			mediaRoot := a.cfg.Magento.MediaPath
 
-			// Resolve the size sets, most explicit source first. The order
-			// matters: a hash given by hand is a deliberate statement about
-			// what to warm, while discovery is a best guess at what the theme
-			// happens to ask for.
-			fileForHashes := resolveFlag(cmd, "hash-file", hashFile, a.cfg.Warm.HashFile)
-			var (
-				sizeSets []string
-				source   string
-			)
-			switch {
-			case len(hashes) > 0:
-				sizeSets, source = hashes, "given with --cache-hash"
-			case len(a.cfg.Warm.CacheHashes) > 0:
-				sizeSets, source = a.cfg.Warm.CacheHashes, "given in warm.cacheHashes"
-			case fileForHashes != "":
-				loaded, err := warm.ReadHashFile(fileForHashes)
-				if err != nil {
-					return fmt.Errorf("read hash file: %w", err)
-				}
-				if len(loaded) == 0 {
-					return fmt.Errorf("%s lists no cache hashes", fileForHashes)
-				}
-				sizeSets, source = loaded, "read from "+fileForHashes
-			default:
-				dir := warm.CacheDir(mediaRoot)
-				found, err := warm.DiscoverHashes(dir)
-				if err != nil {
+			// Nothing below can work on a release that does not generate
+			// derived images on request, and the symptom it produces — 404s,
+			// or 200s that write nothing — points at the wrong cause. Checking
+			// first costs one stat and a directory read.
+			if !skipSupportCheck {
+				if err := warm.CheckOnDemandSupport(a.cfg.Magento.Root); err != nil {
 					return err
 				}
-				sizeSets, source = found, "discovered in "+dir
-			}
-			if len(sizeSets) == 0 {
-				return warm.ErrNoHashes
 			}
 
 			// The connection is opened lazily and the settings are demanded
@@ -319,16 +340,39 @@ by default.`,
 				return err
 			}
 
+			// Address overrides are settled here, with the rest of the
+			// configuration, so a mistake costs nothing: everything after this
+			// point may walk a catalog with a million files in it. The loopback
+			// mapping goes down first and the explicit entries over it, so a
+			// --resolve always wins over the convenience.
+			resolved, err := warm.ParseResolveEntries(
+				append(append([]string(nil), a.cfg.Warm.Resolve...), resolve...))
+			if err != nil {
+				return err
+			}
+			if loopback || (len(resolve) == 0 && a.cfg.Warm.Loopback) {
+				merged := warm.LoopbackResolve(base)
+				if merged == nil {
+					return fmt.Errorf("--loopback needs a base URL with a host, got %q", base.String())
+				}
+				for k, v := range resolved {
+					merged[k] = v
+				}
+				resolved = merged
+			}
+
 			opts := warm.Options{
-				Concurrency:      resolveFlag(cmd, "concurrency", concurrency, a.cfg.Warm.Concurrency),
-				Timeout:          resolveFlag(cmd, "timeout", timeout, a.cfg.Warm.Timeout.Std()),
-				Method:           resolveFlag(cmd, "method", method, a.cfg.Warm.Method),
-				UserAgent:        resolveFlag(cmd, "user-agent", userAgent, a.cfg.Warm.UserAgent),
-				Rate:             resolveFlag(cmd, "rate", rate, a.cfg.Warm.Rate),
-				MaxRequests:      resolveFlag(cmd, "max-requests", maxRequests, a.cfg.Warm.MaxRequests),
-				MaxErrorFraction: resolveFlag(cmd, "max-error-fraction", maxErrorFraction, a.cfg.Warm.MaxErrorFraction),
-				NoProbe:          noProbe,
-				DryRun:           !apply,
+				Concurrency:        resolveFlag(cmd, "concurrency", concurrency, a.cfg.Warm.Concurrency),
+				Timeout:            resolveFlag(cmd, "timeout", timeout, a.cfg.Warm.Timeout.Std()),
+				Method:             resolveFlag(cmd, "method", method, a.cfg.Warm.Method),
+				UserAgent:          resolveFlag(cmd, "user-agent", userAgent, a.cfg.Warm.UserAgent),
+				Rate:               resolveFlag(cmd, "rate", rate, a.cfg.Warm.Rate),
+				MaxRequests:        resolveFlag(cmd, "max-requests", maxRequests, a.cfg.Warm.MaxRequests),
+				MaxErrorFraction:   resolveFlag(cmd, "max-error-fraction", maxErrorFraction, a.cfg.Warm.MaxErrorFraction),
+				Resolve:            resolved,
+				InsecureSkipVerify: insecure || a.cfg.Warm.InsecureSkipVerify,
+				NoProbe:            noProbe,
+				DryRun:             !apply,
 			}
 			if opts.UserAgent == "" {
 				opts.UserAgent = defaultUserAgent()
@@ -357,11 +401,47 @@ by default.`,
 				return err
 			}
 
-			// Everything above this point is configuration, so it is settled
-			// before the media tree is walked: a typo in a flag should not
-			// cost a scan of a catalog with a million files in it.
+			// Work out which size set to route the requests through. The most
+			// explicit source wins: a hash given by hand is a deliberate
+			// statement, a snapshot is a recollection, and discovery is a guess
+			// at what the tree happens to hold.
+			fileForHashes := resolveFlag(cmd, "hash-file", hashFile, a.cfg.Warm.HashFile)
+			chosen := strings.TrimSpace(resolveFlag(cmd, "cache-hash", cacheHash, a.cfg.Warm.CacheHash))
+			source := ""
+			switch {
+			case chosen != "":
+				source = "given with --cache-hash"
+			case fileForHashes != "":
+				loaded, err := warm.ReadHashFile(fileForHashes)
+				if err != nil {
+					return fmt.Errorf("read hash file: %w", err)
+				}
+				if len(loaded) == 0 {
+					return fmt.Errorf("%s lists no cache hashes", fileForHashes)
+				}
+				chosen, source = loaded[0], "read from "+fileForHashes
+			default:
+				dir := warm.CacheDir(mediaRoot)
+				found, err := warm.DiscoverHashes(dir)
+				if err != nil {
+					return err
+				}
+				if len(found) > 0 {
+					chosen, source = found[0], "discovered in "+dir
+				}
+			}
+			if chosen != "" && !warm.ValidHash(chosen) {
+				return fmt.Errorf("invalid cache hash %q: expected 32 lowercase hex characters", chosen)
+			}
+			trusted := chosen != ""
+			if chosen == "" {
+				// Nothing on the host knows and nothing the operator said
+				// applies, so the run starts from the placeholder set and lets
+				// the shop name the real one. See warm.SeedHash.
+				chosen, source = warm.SeedHash, "not known yet; the first request resolves it"
+			}
 
-			// Collect the originals to pair with the size sets.
+			// Collect the originals to pair with the size set.
 			quiet := a.cfg.Output.Quiet
 			var files []media.File
 			if liveOnly {
@@ -407,7 +487,52 @@ by default.`,
 				files = scan.Files
 			}
 
-			plan, err := warm.BuildPlan(mediaRoot, files, sizeSets, base)
+			// Confirm the size set against what the tree holds, and repair it
+			// when it does not match. A set the theme has stopped asking for
+			// leaves every requested path absent: the run would look like a
+			// total failure, and the next attempt would re-request everything
+			// because nothing it asked for exists. Confirming costs one
+			// request, and only when nothing on disk can answer.
+			firstRel := firstWarmable(files)
+			verified := false
+			if firstRel != "" {
+				if live, liveErr := warm.LiveHash(warm.CacheDir(mediaRoot), firstRel); liveErr == nil {
+					if live != chosen {
+						fmt.Fprintf(a.stderr,
+							"  %s is not a size set this shop uses; routing through %s instead\n",
+							chosen, live)
+					}
+					chosen, source, verified = live, "confirmed against the cache tree", true
+				}
+			}
+			if firstRel != "" && !verified {
+				switch {
+				case !apply:
+					// A dry run issues nothing, by contract. The size of the
+					// job does not depend on which set is used, so the report
+					// stays honest as long as it says the set is unconfirmed.
+					source += " (unconfirmed: a real run resolves it)"
+				case opts.NoProbe && !trusted:
+					return fmt.Errorf("no size set could be read from %s and none was supplied, "+
+						"and --no-probe forbids the one request that would find one. "+
+						"Drop --no-probe, or name a set with --cache-hash",
+						warm.CacheDir(mediaRoot))
+				case opts.NoProbe:
+					source += " (unconfirmed: --no-probe)"
+				default:
+					if !quiet {
+						fmt.Fprintf(a.stderr,
+							"  no variant found under the cache tree; asking the shop which size sets it uses\n")
+					}
+					live, seedErr := warm.Seed(ctx, mediaRoot, firstRel, base, opts)
+					if seedErr != nil {
+						return seedErr
+					}
+					chosen, source = live, "recovered from the shop"
+				}
+			}
+
+			plan, err := warm.BuildPlan(mediaRoot, files, chosen, base)
 			if err != nil {
 				return err
 			}
@@ -433,18 +558,22 @@ by default.`,
 			// is reported separately below, so the two cannot be confused.
 			fmt.Fprintf(a.stdout, "%-14s: %s\n", "media root", mediaRoot)
 			fmt.Fprintf(a.stdout, "%-14s: %s\n", "base url", base.String())
-			fmt.Fprintf(a.stdout, "%-14s: %d (%s)\n", "size sets", len(sizeSets), source)
+			fmt.Fprintf(a.stdout, "%-14s: %s\n", "route",
+				describeRoute(base, opts.Resolve, opts.InsecureSkipVerify))
+			fmt.Fprintf(a.stdout, "%-14s: %s\n", "size set", chosen)
+			fmt.Fprintf(a.stdout, "%-14s: %s\n", "", source)
 			// "N of M files" rather than two separate rows: only the images can
-			// be paired with a size set, so this is the number that multiplies
-			// out to the variants below.
+			// be paired with a size set, so this is the number the plan covers.
 			fmt.Fprintf(a.stdout, "%-14s: %d of %d files\n", "images",
 				warm.WarmableFiles(files), len(files))
-			fmt.Fprintf(a.stdout, "%-14s: %d\n", "variants", res.Candidates)
-			fmt.Fprintf(a.stdout, "%-14s: %d\n", "already cached", res.Skipped)
+			fmt.Fprintf(a.stdout, "%-14s: %d\n", "cached", res.Skipped)
 			fmt.Fprintf(a.stdout, "%-14s: %d\n", "to request", res.Pending)
+			if plan.Ineligible > 0 {
+				fmt.Fprintf(a.stdout, "%-14s: %d\n", "excluded", plan.Ineligible)
+			}
 
 			if res.Pending == 0 {
-				fmt.Fprintf(a.stdout, "\nnothing to do: every variant is already cached\n")
+				fmt.Fprintf(a.stdout, "\nnothing to do: every image already has a cached variant\n")
 				return nil
 			}
 			if !apply {
@@ -455,7 +584,7 @@ by default.`,
 			// OK counts every 2xx, and the pre-flight request is one of them:
 			// the variant it asks for really is generated, so it belongs in
 			// the total rather than being quietly excluded.
-			fmt.Fprintf(a.stdout, "\nwarmed %d of %d variants in %s\n",
+			fmt.Fprintf(a.stdout, "\nwarmed %d of %d images in %s\n",
 				res.OK, res.Pending, res.Duration.Round(time.Millisecond))
 			fmt.Fprintf(a.stdout, "  requests  : %d\n", res.Requests)
 			if res.ClientErrors > 0 {
@@ -475,13 +604,13 @@ by default.`,
 			}
 
 			if res.Truncated {
-				fmt.Fprintf(a.stdout, "\nrun again to continue: variants that now exist are skipped without a request\n")
+				fmt.Fprintf(a.stdout, "\nrun again to continue: images cached by then are skipped without a request\n")
 			}
 			if runErr != nil {
 				return runErr
 			}
 			if failed := res.Failures(); failed > 0 {
-				fmt.Fprintf(a.stdout, "\n%d requests did not return 2xx; a visitor will trigger those variants on demand\n",
+				fmt.Fprintf(a.stdout, "\n%d requests did not return 2xx; a visitor will trigger those images on demand\n",
 					failed)
 			}
 			return nil
@@ -492,10 +621,18 @@ by default.`,
 	fl.BoolVar(&apply, "apply", false, "issue the requests (default is a dry run)")
 	fl.StringVar(&baseURL, "base-url", "",
 		"storefront base URL (default: web/secure/base_url from core_config_data, which needs the database)")
-	fl.StringSliceVar(&hashes, "cache-hash", nil,
-		"size-set hash to warm, repeatable (default: discovered from the cache directory)")
+	fl.StringVar(&cacheHash, "cache-hash", "",
+		"size set to route the requests through (default: read from the cache tree, or recovered with one request)")
 	fl.StringVar(&hashFile, "hash-file", "",
-		"read size-set hashes from this file (default warm.hashFile)")
+		"read size sets from this file (default warm.hashFile)")
+	fl.BoolVar(&loopback, "loopback", false,
+		"dial 127.0.0.1 instead of the address the domain resolves to, keeping the Host header and TLS name")
+	fl.StringSliceVar(&resolve, "resolve", nil,
+		"replace the address dialed for one host, as host:port:address; repeatable")
+	fl.BoolVar(&insecure, "insecure-skip-verify", false,
+		"accept any TLS certificate; needed for a shop whose https certificate is self-signed with no SAN")
+	fl.BoolVar(&skipSupportCheck, "skip-support-check", false,
+		"warm even when the install looks like Magento 2.2, which cannot generate variants on request")
 	fl.IntVar(&concurrency, "concurrency", 0,
 		"parallel requests (default warm.concurrency, 4)")
 	fl.DurationVar(&timeout, "timeout", 0,
@@ -515,4 +652,52 @@ by default.`,
 	fl.BoolVar(&noProbe, "no-probe", false,
 		"skip the pre-flight check that a request produces a cache file")
 	return cmd
+}
+
+// firstWarmable returns the relative path of the first image the plan would
+// cover, or "" when there is none.
+//
+// It is the subject of the one request that establishes which size sets the
+// theme asks for, so it has to be a file that can actually be warmed: a
+// non-image, or a path at the wrong depth, would be resolved by Magento
+// against some other original and answer nothing useful.
+func firstWarmable(files []media.File) string {
+	for i := range files {
+		if warm.WarmableFiles(files[i:i+1]) == 1 {
+			return files[i].RelPath
+		}
+	}
+	return ""
+}
+
+// describeRoute renders how the requests will reach the storefront, which is
+// the first thing to check when a run behaves as if it were talking to the
+// wrong site.
+func describeRoute(base *url.URL, resolve map[string]string, insecure bool) string {
+	route := "direct (" + base.Hostname() + ")"
+	if len(resolve) == 0 {
+		return withTLS(route, base, insecure)
+	}
+	port := base.Port()
+	if port == "" {
+		if base.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	if addr, ok := resolve[net.JoinHostPort(base.Hostname(), port)]; ok {
+		return withTLS(fmt.Sprintf("%s, Host: %s", addr, base.Hostname()), base, insecure)
+	}
+	return withTLS(fmt.Sprintf("overridden for %d address(es)", len(resolve)), base, insecure)
+}
+
+// withTLS appends a warning when certificate verification is off. The run's
+// output is the only place an operator can see that it is, and a warm run is
+// long enough that nobody re-reads the command line it was started with.
+func withTLS(route string, base *url.URL, insecure bool) string {
+	if !insecure || base.Scheme != "https" {
+		return route
+	}
+	return route + ", TLS not verified"
 }

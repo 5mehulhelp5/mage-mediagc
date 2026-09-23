@@ -100,8 +100,11 @@ cleanup:
 
 warm:
   baseUrl: ""                       # default from core_config_data
-  cacheHashes: []                   # pin size sets by hand
+  cacheHash: ""                     # route requests through one size set
   hashFile: ""                      # snapshot written by cache clean --save-hashes
+  loopback: false                   # dial 127.0.0.1, keep the Host header
+  resolve: []                       # "host:port:address" overrides
+  insecureSkipVerify: false         # accept a self-signed certificate
   concurrency: 4                    # requests in flight
   timeout: 30s                      # per request
   method: get                       # get | head
@@ -174,11 +177,32 @@ the storefront's spare capacity, not this machine's CPU. Raise it once you have
 measured — `--max-requests 500` plus the reported duration is a cheap way to
 find the throughput the shop will tolerate.
 
+**`warm.cacheHash`** — route the requests through one size set. Leave it empty.
+The value is read from the cache tree, and when the tree is empty the run
+recovers one by asking the shop. It is a pin for a known-good value, not a
+setting to fill in: a set the theme has stopped asking for makes every requested
+path stay absent, and while that is detected and corrected, there is no reason to
+create the situation.
+
 **`warm.hashFile`** — the snapshot `cache clean --save-hashes` writes and
-`cache warm --hash-file` reads. It holds the size-set hashes, which nothing on
-the host can reconstruct afterwards: they are derived from the theme's
-`view.xml` through Magento's own code, and after the cache is emptied there is
-nothing left to discover them from.
+`cache warm --hash-file` reads. The cache tree is the cheapest place to read the
+theme's size sets from, and it is gone once emptied, so a snapshot saves the one
+request a cold start would otherwise spend recovering one. Optional.
+
+**`warm.loopback`** / **`warm.resolve`** — how the run reaches the storefront.
+`loopback` dials `127.0.0.1` while leaving the Host header and the TLS server
+name alone, so the web server still routes the request to the right site; set it
+when the tool runs on the shop's own server, where it costs no external bandwidth
+and needs no working DNS for the shop's domain. Unlike an `/etc/hosts` entry it
+cannot silently reach the wrong vhost on a host that serves several shops.
+`resolve` lists `host:port:address` overrides for the cases loopback does not
+cover, and an override also turns off the environment's `HTTP_PROXY`, which would
+otherwise carry the request off the machine.
+
+**`warm.insecureSkipVerify`** — accept any TLS certificate. Necessary for a shop
+whose https certificate is self-signed for an internal name and so carries no
+subject alternative name, because Go rejects that regardless of who trusts it.
+The run reports when the option is on.
 
 ```sh
 mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt

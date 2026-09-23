@@ -3,21 +3,65 @@
 //
 // Magento writes every resized variant under
 //
-//	<mediaRoot>/cache/<hash>/<path of the original>
+//	<mediaRoot>/cache/<hash>/<dir>/<dir>/<file>
 //
-// where <hash> is an md5 of the size parameters, and it generates a variant on
-// the first request for it. Asking the web server for those URLs therefore
-// fills the cache through exactly the code path a visitor would take, which is
-// why warming needs no PHP runtime, no bin/magento and no Composer on the host.
+// where <hash> identifies a size set and the trailing path mirrors the
+// original. Asking the web server for such a URL fills the cache through
+// exactly the code path a visitor takes, which is why warming needs no PHP
+// runtime, no bin/magento and no Composer on the host.
 //
-// The hash is an implementation detail of Magento's PHP code and cannot be
-// reproduced from Go with any confidence, so it is discovered from the cache
-// directory (or supplied explicitly) rather than computed. A wrong hash would
-// mean issuing hundreds of thousands of requests against a URL space that does
-// not exist, and every one of them would look like a success.
+// # One request fills the whole size-set family
+//
+// Since Magento 2.3 the request is handled by
+// Magento\MediaStorage\App\Media::launch, which calls
+// ImageResize::resizeFromImageName() on the original behind the requested cache
+// path. That regenerates the derived image for every size set the theme
+// defines, not only the one that was asked for, so one request per original is
+// enough. Requesting once per (original, size set) pair — the obvious reading
+// of the URLs — multiplies the job by the number of size sets, typically
+// twenty-five, for no gain.
+//
+// # The hash segment is a route, not a request
+//
+// Two properties of the same code path shape everything else here, and both are
+// cheap to confirm by hand on a test install:
+//
+//   - Magento never validates the hash. Any 32 hex characters reach the resize
+//     service and produce the full family of sets the theme asks for. The value
+//     is the md5 of PHP-side parameters (Magento\Catalog\Model\Product\
+//     Image\ParamsBuilder builds them, View\Asset\Image::getMiscPath hashes
+//     them), so it cannot be reproduced here with any confidence. It does not
+//     need to be.
+//   - The requested path is what the caller stats to decide whether a variant
+//     exists, and it is only created when the hash names a set the theme really
+//     asks for. A made-up hash therefore warms the whole family while leaving
+//     the URL that was asked for absent, which reads as failure.
+//
+// So a hash has to be live — see LiveHash — but which live one is used does not
+// matter, and only one is needed.
+//
+// # The path depth is fixed
+//
+// Media::getOriginalImage() recovers the original from the request with
+//
+//	return preg_replace('|^.*((?:/[^/]+){3})$|', '$1', $resizedImagePath);
+//
+// that is, it keeps exactly the last three segments. A cache URL must therefore
+// end in two directories and a file name. Magento's own layout always does,
+// which is why the rule costs nothing in practice, but a tree that does not
+// would have its requests resolved against the wrong original — silently
+// generating a variant of some other image. See warmableFile.
+//
+// # Magento 2.2 and earlier cannot do this at all
+//
+// Those releases have no resize service. Media::launch only copies the file out
+// of the media storage backend, so a request for a missing cache URL fails and
+// generates nothing. CheckOnDemandSupport refuses to start rather than
+// launching a run whose every request would be wasted.
 package warm
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -32,6 +76,21 @@ import (
 // hashLen is the length of a Magento size-set directory name, which is the
 // hex form of an md5 digest.
 const hashLen = 32
+
+// SeedHash is a size set that is syntactically valid and deliberately
+// meaningless.
+//
+// It exists for the one case nothing on the host can answer: when the cache
+// tree is empty and no hash was supplied, there is no live size set to read off
+// the disk, and Magento leaves no other record of one. Because the hash segment
+// is not validated, a request carrying this value still regenerates the entire
+// family — and the sets that appear afterwards are the live ones, which
+// LiveHash then reads back.
+//
+// It is the all-zero digest rather than something derived, so that nobody
+// mistakes it for a computed value: it carries no information at all, which is
+// exactly its role.
+const SeedHash = "00000000000000000000000000000000"
 
 // placeholderDir is the placeholder directory, relative to the media root.
 //
@@ -64,6 +123,10 @@ func ValidHash(name string) bool {
 // directory, sorted. A missing cache directory is not an error: it is exactly
 // the state reached after `cache clean`, and callers report the empty result
 // themselves.
+//
+// Sorted order is what makes the choice of a hash to try first deterministic,
+// and nothing more: a directory that exists is not necessarily one the theme
+// still asks for. LiveHash is what settles that.
 func DiscoverHashes(cacheDir string) ([]string, error) {
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
@@ -90,13 +153,58 @@ func CacheDir(mediaRoot string) string {
 	return filepath.Join(mediaRoot, media.CacheDirName)
 }
 
+// ErrNoLiveHash reports that no size set under the cache directory holds the
+// variant asked about, which means none of them is one the theme currently
+// asks for.
+var ErrNoLiveHash = errors.New("no live size set: the cache directory holds no " +
+	"variant for that image, so none of the size sets present is one the theme asks for")
+
+// LiveHash returns a size set the theme really asks for, proven rather than
+// guessed.
+//
+// A size set is live when the variant at <hash>/<relPath> exists. That is the
+// same test the warm run applies to each item, so a hash accepted here is one
+// whose URL the run will see materialize — no separate liveness probe, and no
+// reliance on timestamps, which say when a directory was written but not
+// whether anything still asks for it.
+//
+// Stale sets are the norm rather than the exception. The hash is derived from
+// the theme's view.xml and from store configuration, so editing either orphans
+// every existing directory forever: Magento writes into the sets it wants and
+// never sweeps the ones it has stopped wanting. Picking by recency would pick a
+// stale set whenever a rebuild touched it last.
+//
+// Callers that find nothing here can issue one request with SeedHash and try
+// again — the family it generates is exactly the set of live ones.
+func LiveHash(cacheDir, relPath string) (string, error) {
+	hashes, err := DiscoverHashes(cacheDir)
+	if err != nil {
+		return "", err
+	}
+	for _, h := range hashes {
+		if _, err := os.Stat(VariantPath(cacheDir, h, relPath)); err == nil {
+			return h, nil
+		}
+	}
+	return "", ErrNoLiveHash
+}
+
+// VariantPath returns the path of a cached variant inside a cache directory.
+//
+// CachePath is the same value derived from a media root; this form exists so
+// that the live-hash search, which is handed a cache directory, does not have
+// to reconstruct the root only to take it apart again.
+func VariantPath(cacheDir, hash, relPath string) string {
+	return filepath.Join(cacheDir, hash, filepath.FromSlash(relPath))
+}
+
 // CachePath returns the absolute path Magento serves a cached variant from.
 //
 // The cache tree mirrors the layout of the originals below the size-set
 // directory, which is what makes the mapping a prefix substitution and nothing
 // more.
 func CachePath(mediaRoot, hash, relPath string) string {
-	return filepath.Join(mediaRoot, media.CacheDirName, hash, filepath.FromSlash(relPath))
+	return VariantPath(CacheDir(mediaRoot), hash, relPath)
 }
 
 // CacheURL returns the public URL of a cached variant.
@@ -138,6 +246,9 @@ func ParseBaseURL(raw string) (*url.URL, error) {
 
 // ReadHashFile loads a hash snapshot written by WriteHashFile. Blank lines and
 // lines starting with # are ignored, so the file stays editable by hand.
+//
+// The file is a hint, not an authority: a snapshot taken before the theme or the
+// store configuration changed names sets that no longer exist. LiveHash decides.
 func ReadHashFile(p string) ([]string, error) {
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -168,7 +279,10 @@ func ReadHashFile(p string) ([]string, error) {
 //
 // The point of the file is the gap between the two halves of a cache rebuild:
 // the hashes have to be read off the disk before the cache is emptied, because
-// afterwards nothing on the host says which size sets the theme asks for.
+// afterwards nothing on the host says which size sets the theme asks for. It is
+// a convenience rather than a requirement — a run that starts with an empty
+// tree can recover a live set on its own, at the cost of one request — but a
+// run given one does not have to.
 func WriteHashFile(p string, hashes []string) error {
 	if dir := filepath.Dir(p); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -189,7 +303,7 @@ func WriteHashFile(p string, hashes []string) error {
 	return nil
 }
 
-// WarmableFiles counts the originals that can be paired with a size set.
+// WarmableFiles counts the originals the plan can be built from.
 //
 // It is exported so a caller can report a number that multiplies out: only
 // these files produce variants, so a total taken over every file on disk would
@@ -205,13 +319,22 @@ func WarmableFiles(files []media.File) int {
 	return n
 }
 
-// warmableFile reports whether an original is worth pairing with a size set.
+// warmableFile reports whether an original can be warmed through a cache URL.
 //
-// Three exclusions matter. Files inside the cache tree are the output, not the
-// input. Placeholder images never take the cache path. And the extension is
+// Four exclusions matter. Files inside the cache tree are the output, not the
+// input. Placeholder images never take the cache path. The extension is
 // restricted to the formats Magento resizes reliably, so that stray files a
 // catalog collects (an .htaccess, importer staging debris) do not turn into
 // 404s that then look like a broken run.
+//
+// The last one is the path depth, and it is the reason this check is not merely
+// a filter. Magento recovers the original by keeping the last three segments of
+// the request path (see the package comment), so a file at any other depth is
+// requested against a different original and would quietly generate the wrong
+// image — or, more often, fail and be reported as a transport problem. Magento
+// stores catalog images exactly two directories deep, so the rule admits every
+// real original and nothing else. Excluded files are counted, not dropped
+// silently.
 func warmableFile(rel string) bool {
 	if rel == "" || media.IsCachePath(rel) {
 		return false
@@ -219,9 +342,19 @@ func warmableFile(rel string) bool {
 	if rel == placeholderDir || strings.HasPrefix(rel, placeholderDir+"/") {
 		return false
 	}
-	switch strings.ToLower(path.Ext(rel)) {
-	case ".jpg", ".jpeg", ".png", ".gif":
-		return true
+	if !isImageFile(rel) {
+		return false
 	}
-	return false
+	// Two directories and a file name: exactly what the last-three-segments
+	// rule expects to find.
+	segments := 0
+	for _, s := range strings.Split(rel, "/") {
+		if s != "" {
+			segments++
+		}
+	}
+	return segments == originalDepth
 }
+
+// originalDepth is the number of path segments Media::getOriginalImage keeps.
+const originalDepth = 3

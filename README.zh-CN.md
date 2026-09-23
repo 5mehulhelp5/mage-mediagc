@@ -88,34 +88,67 @@ mage-mediagc scan -v
 Magento 的缩略图缓存是派生数据，删掉后访客访问时会自动重建。这是最安全的一刀，
 代价是「重建」要由第一批访客来承担——他们得等 PHP 现场缩放图片。
 
-`cache warm` 把这份代价提前扛下来：它把每张原图和主题用到的每种尺寸组合配对，
-然后**通过店面**请求那些派生 URL，让 Magento 走一遍和访客浏览器完全相同的代码路径
-生成。所以它不需要在店铺里装任何东西：不要 PHP 运行时、不要 `bin/magento`、
-不要 Composer、不要模块——只需要能访问店面的 HTTP，因此可以从笔记本、跳板机或 CI
-对着一个你没有 shell 的站点跑。
+`cache warm` 把这份代价提前扛下来：它**按原图**发请求——每张原图一个 URL，让
+Magento 走一遍和访客浏览器完全相同的代码路径，把这张图的变体生成出来。所以它不需要
+在店铺里装任何东西：不要 PHP 运行时、不要 `bin/magento`、不要 Composer、不要模块——
+只需要能访问店面的 HTTP，因此可以从笔记本、跳板机或 CI 对着一个你没有 shell 的站点跑。
+
+**一张原图只发一个请求，不是每种尺寸一个。** 因为 Magento 2.3 起单个请求会重新生成
+这张图在主题定义的**所有**尺寸组合里的变体——标准主题是 25 组。6 万张图就是 6 万次
+请求，而不是 150 万次。
 
 ```sh
 mage-mediagc cache stats
 mage-mediagc cache clean          # 预演，只报告不动手
-# 清空前先把尺寸组合记下来——清空之后就再也找不回来了
+# 清空前先把尺寸组合记下来——清空之后就只能重新问了
 mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
 # 预热：先预演（不发出任何请求，只报工作量），再真跑
 mage-mediagc cache warm --hash-file var/cache-hashes.txt
 mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
 ```
 
-**`--save-hashes` 是这一步唯一的要点。** Magento 用尺寸参数的 md5 给每个缓存目录
-命名，这个哈希来自 PHP 侧、无法在 Go 里算出来，所以工具是**从目录里读出来**的——
-而只有缓存还在的时候才读得到。快照文件就是让这个信息跨过「清空」与「重填」之间的
-空档的东西。没有快照，尺寸组合就只能等第一批访客一个请求一个请求地重新暴露出来。
+请求路径里必须带一个尺寸组合，而 Magento 用一串 PHP 侧私有参数的 md5 给这些目录命名
+（参数来自主题的 `view.xml` 和店铺配置）。工具不自己算这个哈希，而是**发现**它：
+依次看 `--cache-hash`、配置里的 `warm.cacheHash`、`--hash-file` 快照、缓存目录本身；
+**四个来源都空的时候，就问店铺一次**，然后从磁盘上把答案读回来。只需要一个——其余
+会让请求自己重新生成——但必须是主题当前真正在用的那个：取到了陈旧的哈希会被换成活的
+并在报告里写清楚。
 
-两个设计让它敢对着线上站点跑：已经存在的变体用本地 `stat` 跳过、不发请求，所以
-中断后重跑几乎零成本、也不会重复生成；正式开跑前会**先单独发一个请求**并检查它的
-缓存文件是否真的出现——如果请求返回 200 却没有生成文件，整轮立即中止，因为那正是
-CDN 或反代在边缘直接应答的样子。
+第三条路（问一次）意味着**`--save-hashes` 不再是必选项**，它只是个捷径：跨过清空与
+重填之间的空档，省掉那一次探测请求。`cache clean` 之后完全没有快照也能直接预热。
+
+三个设计让它敢对着线上站点跑：已经存在的变体用本地 `stat` 跳过、不发请求，所以中断后
+重跑几乎零成本、也不会重复生成；正式开跑前会**先单独发一个请求**并检查它的缓存文件
+是否真的出现——如果请求返回 200 却没有生成文件，整轮立即中止，因为那正是 CDN 或反代
+在边缘直接应答的样子；**Magento 2.2 及更早版本会被直接拒绝**，因为那些版本收到请求
+什么都不会生成（按需生成的 `ImageResize` 服务是 2.3 才有的），跑下去纯属浪费——报错
+信息会指名那个缺失的文件，并指向 `bin/magento catalog:images:resize`，
+`--skip-support-check` 可以强行越过。
 
 顺带一提，「干脆用 `php bin/magento catalog:images:resize`」是更差的选择：那条命令
 单线程、会重复处理已存在的变体、且不能中断；`cache warm` 跳过已有的、并发做剩下的。
+（也注意 `catalog:images:resize --async` 只有 Adobe Commerce 2.4+ 有，2.2/2.3 用不上。）
+
+| 参数 | 作用 |
+| --- | --- |
+| `--apply` | 真正发出请求；不加只报告计划 |
+| `--base-url` | 店面地址，默认取 `core_config_data` 的 `web/secure/base_url` |
+| `--hash-file` | 从快照读尺寸组合 |
+| `--cache-hash` | 指定走哪一组尺寸组合 |
+| `--loopback` | 拨 `127.0.0.1` 但保留 Host 头，用于在店铺本机跑 |
+| `--resolve` | 把某个 host:port 实际拨号的地址换掉 |
+| `--insecure-skip-verify` | 接受自签证书（Go 会因证书没有 SAN 而拒绝） |
+| `--skip-support-check` | 明知是 Magento 2.2 也照跑 |
+| `--concurrency` | 并发请求数（默认 4） |
+| `--rate` | 每秒请求启动数上限，给还在接客的店铺用 |
+| `--max-requests` | 发满 N 个请求就停，用于把大盘分成几批 |
+| `--live-only` | 只预热仍被引用的图片（需要数据库） |
+| `--no-probe` | 跳过预检，前提是你已经手工验证过 URL 映射 |
+
+有四条边界值得先知道：店面必须**在源站**可达，不能隔着已经缓存了图片的 CDN；webp 和
+CMYK 变体不预热，因为要不要生成它们取决于本工具不读的配置；`--live-only` 和默认的
+base URL 查询需要数据库，显式传 `--base-url` 就能在完全没有数据库的情况下用；以及
+`cache clean` 之后如果没有快照，尺寸组合得靠一次探测请求重新问回来。
 
 ### ⑤ 隔离孤儿原图（是「移动」，不是「删除」）
 
@@ -161,6 +194,7 @@ mage-mediagc db-clean --apply     # 再删
 | 列出孤儿文件路径（喂给 rsync） | `mage-mediagc list --kind orphan -o orphans.txt` |
 | 清缩略图缓存 | `mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt` |
 | 重建缩略图缓存（预热） | `mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply` |
+| 在店铺本机预热（域名解析不了） | `mage-mediagc cache warm --loopback --apply` |
 | 隔离孤儿原图 / 回滚 | `mage-mediagc quarantine --apply` / `mage-mediagc restore --apply` |
 | 真删、释放空间 | `mage-mediagc purge --apply` |
 | 清数据库孤儿行 | `mage-mediagc db-clean --apply` |

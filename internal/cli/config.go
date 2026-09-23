@@ -62,8 +62,10 @@ func newConfigShowCmd(a *app) *cobra.Command {
 			fmt.Fprintf(tw, "orphan threshold\t%.2f\n", a.cfg.Cleanup.MaxDeleteFraction)
 			fmt.Fprintf(tw, "batch size\t%d\n", a.cfg.Cleanup.BatchSize)
 			fmt.Fprintf(tw, "warm base url\t%s\n", orNone(a.cfg.Warm.BaseURL))
-			fmt.Fprintf(tw, "warm size sets\t%d\n", len(a.cfg.Warm.CacheHashes))
+			fmt.Fprintf(tw, "warm size set\t%s\n", orNone(a.cfg.Warm.CacheHash))
 			fmt.Fprintf(tw, "warm hash file\t%s\n", orDash(a.cfg.Warm.HashFile))
+			fmt.Fprintf(tw, "warm loopback\t%v\n", a.cfg.Warm.Loopback)
+			fmt.Fprintf(tw, "warm resolve\t%s\n", orDash(strings.Join(a.cfg.Warm.Resolve, ", ")))
 			fmt.Fprintf(tw, "warm concurrency\t%d\n", a.cfg.Warm.Concurrency)
 			fmt.Fprintf(tw, "warm timeout\t%s\n", a.cfg.Warm.Timeout.Std())
 			fmt.Fprintf(tw, "warm method\t%s\n", orNone(a.cfg.Warm.Method))
@@ -187,15 +189,36 @@ warm:
   # Point this at the origin, not at a CDN: a CDN that already holds the image
   # will answer without the origin ever generating it.
   baseUrl: ""
-  # Size sets to warm, as hex hashes. Leave empty: they are discovered from
-  # media/catalog/product/cache/ (or read from hashFile). Only set this to
-  # pin a specific set, for example to re-warm one after a theme change.
-  cacheHashes: []
+  # Size set to route the requests through, as a 32-character hex hash. Leave
+  # empty: it is read from media/catalog/product/cache/, or recovered with one
+  # request when the tree is empty.
+  #
+  # Any live set will do — a request regenerates every size set the theme
+  # defines, whatever hash was asked for — but a set the theme has stopped
+  # asking for is worse than useless, so this is a pin for a known value rather
+  # than a setting to guess at. A value that no longer matches is corrected at
+  # runtime and reported.
+  cacheHash: ""
   # Snapshot of the size sets, written by "cache clean --save-hashes <file>"
-  # before the cache is emptied. After a clean, nothing on the host remembers
-  # which size sets the theme asks for, and discovery has nothing left to look
-  # at.
+  # before the cache is emptied. Saves the one request a cold start would spend
+  # recovering a live set. Optional.
   hashFile: ""
+  # Send the traffic to 127.0.0.1 instead of the address the storefront's domain
+  # resolves to, keeping the Host header and the TLS server name, so the web
+  # server still routes it to the right site. Set this when the tool runs on the
+  # shop's own server: it spends no external bandwidth, and unlike an /etc/hosts
+  # entry it keeps working on a host serving several shops.
+  loopback: false
+  # Replace the address dialed for one host and port, as "host:port:address".
+  # Only needed where loopback is not enough — a container network, a second
+  # interface, a Unix socket front end. Repeatable.
+  resolve: []
+  # Accept any TLS certificate. Needed for a shop whose https certificate is
+  # self-signed for an internal name and so carries no subject alternative
+  # name: Go rejects that regardless of whether a client would trust the CA.
+  # The run reports when this is on, because it can no longer tell the shop
+  # from anything else answering on the same address.
+  insecureSkipVerify: false
   # Requests in flight. Keep it modest: every request makes the storefront
   # resize an image on the same PHP workers that serve visitors.
   concurrency: 4

@@ -2,12 +2,17 @@ package warm
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,24 +44,43 @@ func ParseMethod(s string) (string, error) {
 	return "", fmt.Errorf("unsupported method %q (want %s or %s)", s, MethodGet, MethodHead)
 }
 
-// Item is one cached variant that has to be requested.
+// Item is one original whose derived image has to be requested.
+//
+// There is deliberately no per-size-set dimension. One request regenerates the
+// whole family on Magento 2.3 and later (see the package comment), so the Hash
+// below is a route into the resize service rather than a statement about which
+// variant is wanted.
 type Item struct {
-	RelPath   string `json:"relPath"`
-	Hash      string `json:"hash"`
+	RelPath string `json:"relPath"`
+	Hash    string `json:"hash"`
+	// CachePath is the variant the request has to create, and the file whose
+	// existence decides whether this item is still outstanding.
 	CachePath string `json:"cachePath"`
-	URL       string `json:"url"`
+	// SourcePath is the original on this host, used to diagnose a request that
+	// returned 2xx without producing a file.
+	SourcePath string `json:"sourcePath"`
+	URL        string `json:"url"`
 }
 
 // Plan is the work a warm run has ahead of it.
 type Plan struct {
-	MediaRoot string   `json:"mediaRoot"`
-	BaseURL   string   `json:"baseUrl"`
-	Hashes    []string `json:"hashes"`
-	// Items holds the variants that are missing on disk, in the order the
-	// scan returned the originals.
+	MediaRoot string `json:"mediaRoot"`
+	BaseURL   string `json:"baseUrl"`
+	// Hash is the single live size set every request is routed through.
+	Hash string `json:"hash"`
+	// Eligible counts the originals that can be warmed by this route: the ones
+	// that Ineligible does not account for.
+	Eligible int64 `json:"eligible"`
+	// Ineligible counts the image files this route cannot serve, which today
+	// means those whose path is not two directories and a file name. They are
+	// reported rather than dropped: a plan that quietly covers less than the
+	// catalog is worse than one that says so.
+	Ineligible int64 `json:"ineligible"`
+	// Items holds the originals whose variant is missing, in the order the
+	// scan returned them.
 	Items []Item `json:"-"`
-	// Skipped counts the variants that already exist and therefore need no
-	// request at all.
+	// Skipped counts the originals that already have a variant under Hash and
+	// therefore need no request at all.
 	Skipped int64 `json:"skipped"`
 }
 
@@ -74,6 +98,26 @@ type Options struct {
 	// MaxErrorFraction aborts the run's verdict when the share of failed
 	// requests exceeds it.
 	MaxErrorFraction float64
+	// Resolve replaces the address dialed for a given "host:port", leaving the
+	// URL — and therefore the Host header, the TLS server name and the
+	// certificate check — untouched. It is what lets a run on the server itself
+	// talk to 127.0.0.1 while the shop still sees its own domain, which is the
+	// only way one client can serve several vhosts on one host.
+	Resolve map[string]string
+	// InsecureSkipVerify accepts any TLS certificate.
+	//
+	// It exists for one situation, and it is a common one: warming a shop on the
+	// server it runs on, where the certificate is self-signed for the internal
+	// name and no public CA ever validated it. Go rejects a certificate that
+	// carries only a Common Name and no subject alternative name outright, so
+	// without this such a shop cannot be warmed over https at all — and
+	// https is what its own base URL says, so a plain http request is answered
+	// with a redirect straight back into the same problem.
+	//
+	// It is still a real loss of protection: the run can no longer tell the shop
+	// from anything else answering on that address. That is why the run reports
+	// it, and why it is opt-in rather than implied by Resolve.
+	InsecureSkipVerify bool
 	// NoProbe skips the pre-flight check described on Run.
 	NoProbe bool
 	// DryRun stops after the plan is costed, issuing nothing.
@@ -83,7 +127,7 @@ type Options struct {
 
 // Result summarizes a warm run.
 type Result struct {
-	Candidates      int64         `json:"candidates"`
+	Planned         int64         `json:"planned"`
 	Pending         int64         `json:"pending"`
 	Skipped         int64         `json:"skipped"`
 	Requests        int64         `json:"requests"`
@@ -108,19 +152,21 @@ func (r Result) FailureRate() float64 {
 	return float64(r.Failures()) / float64(r.Requests)
 }
 
-// ErrNoHashes is returned when the size sets could not be determined.
-var ErrNoHashes = errors.New("no thumbnail cache hashes: " +
-	"the cache directory is empty and no hash was supplied. " +
+// ErrNoHashes is returned when no size set was supplied and none could be read
+// off the disk.
+var ErrNoHashes = errors.New("no thumbnail cache hash: " +
+	"the cache directory holds no size sets and no hash was supplied. " +
 	"Load one product page and retry, pass --cache-hash, " +
 	"or restore a snapshot written with --hash-file")
 
 // ErrProbe reports that the pre-flight check showed requests are not producing
 // cache files, which makes the rest of the run pointless.
 type ErrProbe struct {
-	URL       string
-	CachePath string
-	Status    int
-	Err       error
+	URL        string
+	CachePath  string
+	SourcePath string
+	Status     int
+	Err        error
 }
 
 func (e *ErrProbe) Error() string {
@@ -133,11 +179,12 @@ func (e *ErrProbe) Error() string {
 				"is reachable from this host", e.URL, e.Status)
 	}
 	return fmt.Sprintf(
-		"probe request to %s returned HTTP %d but %s was not created. "+
+		"probe request to %s returned HTTP %d but %s was not created. The original is %s. "+
 			"Either this installation lays the cache out differently, or something in front of "+
 			"the web server answered without reaching PHP (a CDN or reverse proxy). "+
-			"Point --base-url at the origin, or pass --no-probe once you have confirmed the mapping by hand",
-		e.URL, e.Status, e.CachePath)
+			"Point --base-url at the origin, or pass --no-probe once you have confirmed "+
+			"the mapping by hand",
+		e.URL, e.Status, e.CachePath, e.SourcePath)
 }
 
 // Unwrap exposes the underlying transport error, if any.
@@ -158,45 +205,107 @@ func (e *ErrFailureRate) Error() string {
 		e.Failures, e.Requests, float64(e.Failures)/float64(e.Requests)*100, e.Limit*100)
 }
 
-// BuildPlan pairs every original with every size set and keeps the pairs whose
-// cache file is missing.
+// BuildPlan pairs every warmable original with the one live size set and keeps
+// the ones whose variant is missing.
 //
 // The existence check is a local stat, not a request. That is what makes an
 // interrupted run cheap to pick up again: re-running simply finds less work,
 // with no probing and no wasted traffic.
-func BuildPlan(mediaRoot string, files []media.File, hashes []string, base *url.URL) (*Plan, error) {
-	if len(hashes) == 0 {
+//
+// hash must be a set the theme asks for. Anything else still fills the cache
+// when requested, but leaves every path in this plan absent, so the run would
+// look like it failed at every step — and, worse, would re-request everything
+// on the next attempt. LiveHash is what establishes the difference.
+func BuildPlan(mediaRoot string, files []media.File, hash string, base *url.URL) (*Plan, error) {
+	if hash == "" {
 		return nil, ErrNoHashes
 	}
-	for _, h := range hashes {
-		if !ValidHash(h) {
-			return nil, fmt.Errorf("invalid cache hash %q: expected 32 lowercase hex characters", h)
-		}
+	if !ValidHash(hash) {
+		return nil, fmt.Errorf("invalid cache hash %q: expected 32 lowercase hex characters", hash)
 	}
 	p := &Plan{
 		MediaRoot: mediaRoot,
 		BaseURL:   base.String(),
-		Hashes:    append([]string(nil), hashes...),
+		Hash:      hash,
 	}
+	cacheDir := CacheDir(mediaRoot)
 	for _, f := range files {
-		if !warmableFile(f.RelPath) {
+		if !isImageFile(f.RelPath) {
 			continue
 		}
-		for _, h := range hashes {
-			cachePath := CachePath(mediaRoot, h, f.RelPath)
-			if _, err := os.Stat(cachePath); err == nil {
-				p.Skipped++
-				continue
-			}
-			p.Items = append(p.Items, Item{
-				RelPath:   f.RelPath,
-				Hash:      h,
-				CachePath: cachePath,
-				URL:       CacheURL(base, h, f.RelPath),
-			})
+		if !warmableFile(f.RelPath) {
+			p.Ineligible++
+			continue
 		}
+		p.Eligible++
+		cachePath := VariantPath(cacheDir, hash, f.RelPath)
+		if _, err := os.Stat(cachePath); err == nil {
+			p.Skipped++
+			continue
+		}
+		p.Items = append(p.Items, Item{
+			RelPath:    f.RelPath,
+			Hash:       hash,
+			CachePath:  cachePath,
+			SourcePath: filepath.Join(mediaRoot, filepath.FromSlash(f.RelPath)),
+			URL:        CacheURL(base, hash, f.RelPath),
+		})
 	}
 	return p, nil
+}
+
+// isImageFile reports whether a path carries one of the extensions Magento
+// resizes. It is the half of warmableFile that says nothing about where the
+// file sits, so that a caller can tell "not an image at all" — which is not the
+// operator's problem — from "an image this route cannot serve", which is.
+func isImageFile(rel string) bool {
+	switch strings.ToLower(path.Ext(rel)) {
+	case ".jpg", ".jpeg", ".png", ".gif":
+		return true
+	}
+	return false
+}
+
+// Seed issues the single request that establishes which size sets the theme
+// asks for, and returns one of them.
+//
+// It is the cold-start path. With an empty cache tree nothing on the host says
+// which sets are current, and Magento keeps no such record elsewhere — the hash
+// is computed from PHP-side parameters on each request. What the host will
+// reveal, though, is the family of sets that one request generates, so asking
+// once is enough to find out. See SeedHash.
+//
+// The request goes through the same client as the run itself, so it honors the
+// method, the timeout and any address overrides; it is not a side channel with
+// different behavior from the work that follows.
+func Seed(ctx context.Context, mediaRoot, relPath string, base *url.URL, opts Options) (string, error) {
+	method, err := ParseMethod(opts.Method)
+	if err != nil {
+		return "", err
+	}
+	item := Item{
+		RelPath:    relPath,
+		Hash:       SeedHash,
+		CachePath:  CachePath(mediaRoot, SeedHash, relPath),
+		SourcePath: filepath.Join(mediaRoot, filepath.FromSlash(relPath)),
+		URL:        CacheURL(base, SeedHash, relPath),
+	}
+	r := &runner{client: newClient(opts), method: method, ua: opts.UserAgent, res: &Result{}}
+	code, reqErr := r.fetch(ctx, item)
+	if reqErr != nil {
+		return "", fmt.Errorf("seed request to %s failed: %w", item.URL, reqErr)
+	}
+	if code < 200 || code >= 300 {
+		return "", fmt.Errorf("seed request to %s returned HTTP %d; "+
+			"check --base-url and that the storefront is reachable from this host", item.URL, code)
+	}
+	live, liveErr := LiveHash(CacheDir(mediaRoot), relPath)
+	if liveErr != nil {
+		return "", fmt.Errorf("the seed request to %s returned HTTP %d but no variant appeared "+
+			"under %s, so this storefront did not generate one. %w",
+			item.URL, code, CacheDir(mediaRoot), liveErr)
+	}
+	return live, nil
 }
 
 // Run issues the planned requests.
@@ -209,9 +318,9 @@ func BuildPlan(mediaRoot string, files []media.File, hashes []string, base *url.
 func Run(ctx context.Context, plan *Plan, opts Options) (*Result, error) {
 	started := time.Now()
 	res := &Result{
-		Candidates: plan.Skipped + int64(len(plan.Items)),
-		Pending:    int64(len(plan.Items)),
-		Skipped:    plan.Skipped,
+		Planned: plan.Skipped + int64(len(plan.Items)),
+		Pending: int64(len(plan.Items)),
+		Skipped: plan.Skipped,
 	}
 	// The method is resolved before the dry-run short circuit on purpose. A
 	// dry run exists to surface exactly this kind of mistake while it still
@@ -249,13 +358,16 @@ func Run(ctx context.Context, plan *Plan, opts Options) (*Result, error) {
 		res.Probed = true
 		r.tally(code, reqErr)
 		if reqErr != nil {
-			return res, r.finish(started, opts, &ErrProbe{URL: first.URL, CachePath: first.CachePath, Err: reqErr})
+			return res, r.finish(started, opts, &ErrProbe{
+				URL: first.URL, CachePath: first.CachePath, SourcePath: first.SourcePath, Err: reqErr})
 		}
 		if code < 200 || code >= 300 {
-			return res, r.finish(started, opts, &ErrProbe{URL: first.URL, CachePath: first.CachePath, Status: code})
+			return res, r.finish(started, opts, &ErrProbe{
+				URL: first.URL, CachePath: first.CachePath, SourcePath: first.SourcePath, Status: code})
 		}
 		if _, statErr := os.Stat(first.CachePath); statErr != nil {
-			return res, r.finish(started, opts, &ErrProbe{URL: first.URL, CachePath: first.CachePath, Status: code})
+			return res, r.finish(started, opts, &ErrProbe{
+				URL: first.URL, CachePath: first.CachePath, SourcePath: first.SourcePath, Status: code})
 		}
 		start = 1
 	}
@@ -425,19 +537,37 @@ func newClient(opts Options) *http.Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
+	tr := &http.Transport{
+		MaxIdleConns:        concurrency * 2,
+		MaxIdleConnsPerHost: concurrency,
+		MaxConnsPerHost:     concurrency,
+		IdleConnTimeout:     30 * time.Second,
+		ForceAttemptHTTP2:   true,
+		// The bodies are discarded, so asking for gzip would only spend
+		// CPU on both ends to inflate nothing.
+		DisableCompression: true,
+	}
+	if opts.InsecureSkipVerify {
+		// The name is the point: this is not "trust more", it is "stop
+		// checking". See the field comment for when that is the only way
+		// forward, and why the run says so in its output.
+		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // opt-in, reported, documented
+	}
+	if len(opts.Resolve) > 0 {
+		// An address override is a statement about where the connection goes,
+		// and a proxy would put a third party in the middle of it. Worse, it
+		// would do so invisibly: the environment's HTTP_PROXY is consulted
+		// before the dialer, so a --loopback run on a host with a proxy
+		// configured would still send its traffic off the machine, which is the
+		// single thing the flag exists to prevent. So the override wins.
+		tr.Proxy = nil
+		tr.DialContext = dialResolver(opts.Resolve)
+	} else {
+		tr.Proxy = http.ProxyFromEnvironment
+	}
 	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			MaxIdleConns:        concurrency * 2,
-			MaxIdleConnsPerHost: concurrency,
-			MaxConnsPerHost:     concurrency,
-			IdleConnTimeout:     30 * time.Second,
-			ForceAttemptHTTP2:   true,
-			// The bodies are discarded, so asking for gzip would only spend
-			// CPU on both ends to inflate nothing.
-			DisableCompression: true,
-		},
+		Timeout:   timeout,
+		Transport: tr,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("stopped after 10 redirects")
@@ -445,4 +575,132 @@ func newClient(opts Options) *http.Client {
 			return nil
 		},
 	}
+}
+
+// dialResolver returns a dialer that substitutes the address for the ones it
+// was given, the way curl's --resolve does.
+//
+// The substitution happens at the socket, so the request keeps the URL's host:
+// the Host header, the TLS server name and the certificate check all still
+// speak the shop's own domain. That is the whole point. Rewriting the URL or
+// pointing the name at loopback in /etc/hosts would send the request to
+// whichever vhost the server treats as default, which is wrong the moment a host
+// serves more than one site — and it is wrong silently, because the default
+// vhost answers perfectly well.
+//
+// The lookup key is the literal "host:port" from the URL, which is also what
+// http.Transport passes here, so no port defaulting is needed on this side.
+func dialResolver(resolve map[string]string) func(context.Context, string, string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if target, ok := resolve[addr]; ok {
+			addr = target
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+}
+
+// ResolveEntry parses one "host:port:address" mapping.
+//
+// The shape is the one curl uses for --resolve, minus the separate port on the
+// right-hand side: the replacement is an address, and the port is kept from the
+// left. Formatting it that way makes the common case — this host, but on the
+// loopback interface — a single readable value, which is what an operator
+// typing it into a runbook wants to see. An IPv6 address is written in brackets,
+// as it is anywhere else it appears next to a port.
+func ResolveEntry(raw string) (hostPort, addr string, err error) {
+	host, port, ip, err := splitResolve(raw)
+	if err != nil {
+		return "", "", err
+	}
+	if host == "" {
+		return "", "", fmt.Errorf("--resolve %q: host is empty", raw)
+	}
+	n, convErr := strconv.Atoi(port)
+	if convErr != nil || n < 1 || n > 65535 {
+		return "", "", fmt.Errorf("--resolve %q: %q is not a port", raw, port)
+	}
+	if ip == "" {
+		return "", "", fmt.Errorf("--resolve %q: address is empty", raw)
+	}
+	if net.ParseIP(ip) == nil {
+		return "", "", fmt.Errorf("--resolve %q: %q is not an IP address", raw, ip)
+	}
+	return net.JoinHostPort(host, port), net.JoinHostPort(ip, port), nil
+}
+
+// splitResolve splits "host:port:address" on its colons, allowing the address
+// to be a bracketed IPv6 literal.
+func splitResolve(raw string) (host, port, ip string, err error) {
+	s := strings.TrimSpace(raw)
+	if end := strings.LastIndex(s, "]"); end >= 0 {
+		start := strings.LastIndex(s[:end], "[")
+		if start < 0 {
+			return "", "", "", fmt.Errorf("--resolve %q: unmatched ]", raw)
+		}
+		ip = s[start+1 : end]
+		head := strings.TrimSuffix(strings.TrimSpace(s[:start]), ":")
+		parts := strings.Split(head, ":")
+		if len(parts) != 2 {
+			return "", "", "", fmt.Errorf("--resolve %q: want host:port:[address]", raw)
+		}
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), ip, nil
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) != 3 {
+		return "", "", "", fmt.Errorf("--resolve %q: want host:port:address", raw)
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), strings.TrimSpace(parts[2]), nil
+}
+
+// ParseResolveEntries builds the address map from repeated --resolve values.
+func ParseResolveEntries(raw []string) (map[string]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(raw))
+	for _, entry := range raw {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+		hostPort, addr, err := ResolveEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+		out[hostPort] = addr
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// LoopbackResolve returns the mapping that sends a storefront's traffic to the
+// loopback interface while leaving the request's identity alone.
+//
+// Both default ports are mapped, not only the one the base URL uses, because a
+// shop configured with an https base URL answers a plain http request with a
+// redirect to its own name — and a mapping that covered only 443 would send that
+// redirect straight back out to the internet, where the same host answers over
+// whatever address it has, defeating the point of the exercise.
+func LoopbackResolve(base *url.URL) map[string]string {
+	host := base.Hostname()
+	if host == "" {
+		return nil
+	}
+	port := base.Port()
+	if port == "" {
+		if base.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	out := map[string]string{
+		net.JoinHostPort(host, port): net.JoinHostPort("127.0.0.1", port),
+	}
+	for _, p := range []string{"80", "443"} {
+		out[net.JoinHostPort(host, p)] = net.JoinHostPort("127.0.0.1", p)
+	}
+	return out
 }

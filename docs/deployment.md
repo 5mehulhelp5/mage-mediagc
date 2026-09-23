@@ -106,9 +106,10 @@ data, Magento regenerates each variant on first request, and nothing references
 those files by name. The cost of an unnecessary run is a little CPU.
 
 The unit deliberately passes no `--save-hashes`. A shop busy enough to warrant a
-daily timer has enough traffic to relearn its size sets immediately, so there is
-nothing to rebuild ahead of time. On a quiet shop, or when you want a clean to
-be followed by a warm rather than by the first visitor, run the pair by hand:
+daily timer has enough traffic to keep the size sets discoverable, and
+`cache warm` can recover one on its own in any case. On a quiet shop, or when you
+want a clean to be followed by a warm rather than by the first visitor, run the
+pair by hand — the snapshot then saves the warm run its probe request:
 
 ```sh
 mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt

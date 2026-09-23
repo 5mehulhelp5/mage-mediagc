@@ -174,8 +174,9 @@ two `quarantine` runs would race on the manifest, and `quarantine` racing
 `cache warm` is the exception: two runs against the same cache are merely
 wasteful, not dangerous. Both request the same URLs, Magento generates the same
 files, and the worst outcome is duplicate work — so a large rebuild can be split
-across hosts, each with its own `--max-requests` slice or a different subset of
-`--cache-hash` values.
+across hosts, each with its own `--max-requests` slice. Every host must resolve
+the same size set and reach the origin the same way (`--base-url`, `--loopback`,
+`--resolve`); the pre-flight request catches a host pointed somewhere else.
 
 ### Does `cache warm` need database access?
 

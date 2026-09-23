@@ -156,47 +156,72 @@ mage-mediagc cache clean --apply
 mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
 ```
 
-The file is not a backup of the cache; it is the only record of which size sets
-the theme asks for, and `cache warm --hash-file` is what reads it back. Without
-it, Magento learns the size sets again from whatever the first visitors request.
+The file is not a backup of the cache. It records which size sets the theme
+asks for, which the tree is the cheapest place to read them from; a warm run
+that starts from an empty tree can recover one on its own, at the cost of a
+single request. The snapshot is the shortcut, not the requirement.
 
 Expect a temporary slowdown on the first requests afterwards, and warm the cache
 to avoid it — see below.
 
 ### `cache warm`
 
-Refills the derived cache by pairing every original image with every size set
-and requesting the resulting URLs through the storefront. Magento generates each
-missing variant through the same code path a visitor's browser would take, which
-is why this needs no PHP runtime, no `bin/magento`, no Composer and no module
-installed on the host.
+Refills the derived cache by requesting one cache URL per original image.
+Magento generates each missing variant through the same code path a visitor's
+browser would take, which is why this needs no PHP runtime, no `bin/magento`, no
+Composer and no module installed on the host.
+
+**One request per original, not per variant.** Since Magento 2.3, a request for
+one cached URL makes `ImageResize::resizeFromImageName` regenerate that image's
+variant in *every* size set the theme defines, not only the one named in the
+path. A catalog of 60,000 images is therefore 60,000 requests rather than 1.5
+million, and the command stays practical from a laptop.
 
 It is aimed at the cost `cache clean` defers onto the first visitors: on a large
 catalog, a product page that would have served a cached file instead waits for
 PHP to resize an image. Warming pays that cost up front, concurrently, while
 nobody is waiting.
 
-How the size sets are resolved, most explicit source first:
+Only **one** size set is needed, and which one is used does not matter — the
+request regenerates all of them. How it is resolved, most explicit source first:
 
-1. `--cache-hash` (repeatable)
-2. `warm.cacheHashes` in the config file
-3. `--hash-file`, or `warm.hashFile`
-4. discovered by listing the size-set directories under
+1. `--cache-hash`, or `warm.cacheHash` in the config file
+2. `--hash-file`, or `warm.hashFile`
+3. discovered by listing the size-set directories under
    `media/catalog/product/cache/`
+4. recovered with one request, when the tree is empty and nothing was supplied
 
 The hash is Magento's own: an md5 of PHP-side size parameters, used verbatim as
-the directory name. It is **discovered, never computed** — the parameters are
-private to Magento's image pipeline, and a wrong hash means requesting a URL
-space that does not exist, where every request returns 200 and generates
-nothing. Discovery only works while the cache still holds the hashes, which is
-the entire reason `cache clean --save-hashes` exists.
+the directory name. It is **discovered, never computed**. `ParamsBuilder` builds
+the parameters from `view.xml` *and* from store configuration, so the value
+depends on the theme and on the shop's settings, and the transform that feeds the
+digest differs between Magento 2.2 (`implode` of the raw parameters) and 2.3
+(`convertToReadableFormat` first) — size sets are not portable between those
+releases in either direction.
+
+What matters is that the set is **live**, meaning one the theme currently asks
+for. Magento does not validate the hash: any 32 hex characters reach the resize
+service and produce the whole family of sets. But the path that was actually
+requested is only created when the hash names a live set, so a stale value makes
+every URL in the plan stay absent — the run looks like a complete failure and the
+next attempt re-requests everything. The resolution above is therefore confirmed
+against the tree before the plan is built, and a value that does not hold the
+expected variant is replaced and reported. When nothing on disk can answer — an
+empty tree, no hash supplied — one request is issued with a placeholder value;
+the sets that appear afterwards are the live ones, and the first of them is read
+back off the disk. That request is the only extra traffic a cold start costs, and
+`cache clean --save-hashes` exists to avoid it.
 
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--apply` | off | Issue the requests. Without it, the plan is reported and nothing is requested. |
 | `--base-url <url>` | `web/secure/base_url` | Storefront URL the cache URLs are resolved against. Read from `core_config_data` when omitted, which needs the database. A URL with a query or fragment is rejected. |
-| `--cache-hash <hash>` | — | Pin a size set. Repeatable. Each value must be 32 lowercase hex characters. |
+| `--cache-hash <hash>` | — | Route the requests through one size set. Must be 32 lowercase hex characters. Corrected and reported if it turns out not to be live. |
 | `--hash-file <path>` | `warm.hashFile` | Read size sets from a snapshot. `#` comments and blank lines are ignored, duplicates are collapsed. |
+| `--loopback` | from `warm.loopback` | Dial `127.0.0.1` instead of the address the domain resolves to, keeping the Host header and the TLS server name. Also disables the environment's `HTTP_PROXY`. |
+| `--resolve <host:port:addr>` | from `warm.resolve` | Replace the address dialed for one host and port. Repeatable. An IPv6 address is bracketed. |
+| `--insecure-skip-verify` | from `warm.insecureSkipVerify` | Accept any TLS certificate. Needed when the shop's https certificate is self-signed with no subject alternative name, which Go rejects regardless of trust. Reported in the output. |
+| `--skip-support-check` | off | Proceed even though the install looks like Magento 2.2, which cannot generate variants on request. |
 | `--concurrency <int>` | `warm.concurrency` (`4`) | Requests in flight. |
 | `--timeout <duration>` | `warm.timeout` (`30s`) | Timeout for one request. |
 | `--method <get\|head>` | `warm.method` (`get`) | `head` saves the transfer but a caching proxy may answer it from the edge without generating anything. |
@@ -211,6 +236,37 @@ Values that would otherwise be silently corrected are rejected instead:
 `--concurrency 0` would become one worker, `--timeout 0` thirty seconds, and
 `--max-error-fraction 0` the default. All of them fail before the media tree is
 walked, so a typo never costs a scan of a large catalog.
+
+#### Magento 2.2 and earlier
+
+Those releases generate nothing on request: `Media::launch` only copies the file
+out of the media storage backend, so every URL in the plan fails. The check looks
+for `vendor/magento/module-media-storage/Service/ImageResize.php` — the version
+boundary stated in code, rather than a version string that a patch release might
+not have moved — and refuses before the media tree is walked. That matters
+because the probe's symptom (404s, or 200s that write nothing) points at the
+wrong cause: a CDN or a wrong base URL, rather than an unsupported release. A
+root with no `vendor/` directory at all passes, so a host that mounts only
+`pub/media` keeps working.
+
+#### Reaching a shop on its own server
+
+`--loopback` keeps the request's identity and changes only where the connection
+goes, so the web server still routes it to the right site. That is the difference
+between it and an `/etc/hosts` entry, which sends every request to whichever
+vhost the server treats as default — silently, because the default vhost answers
+perfectly well. It also removes any dependency on the shop's domain resolving
+from where the tool runs, which on a server that hosts its own site is often not
+the case, and it keeps the traffic off the wire entirely.
+
+Two details of the environment are worth knowing. An address override turns the
+environment's `HTTP_PROXY` off, because a proxy is consulted before the dialer
+and would otherwise carry a `--loopback` request off the machine without saying
+so. And a shop whose certificate is self-signed for an internal name cannot be
+reached over https at all until `--insecure-skip-verify` is given: Go requires a
+subject alternative name, so such a certificate is rejected no matter who trusts
+it, and an `http` request to a shop configured with an `https` base URL is
+answered with a redirect into the same problem.
 
 #### The pre-flight check
 
@@ -242,6 +298,11 @@ warm in slices.
 - It does not verify that a generated file is a *correct* image. It checks that
   the request succeeded and the expected path now exists; the pixels are
   Magento's business.
+- It does not warm images whose path is not two directories and a file name.
+  Magento resolves the original from the *last three* segments of the request
+  path, so at any other depth its own mapping points at a different image; those
+  files are excluded and counted rather than requested. Magento stores catalog
+  images in exactly that shape, so nothing real is lost.
 - It does not (yet) offer a way to warm from a list of URLs taken from access
   logs, which would be the way to catch size sets no longer discoverable on
   disk.
@@ -429,8 +490,11 @@ cleanup:
 
 warm:
   baseUrl: ""                              # empty = read core_config_data
-  cacheHashes: []                          # 32-char lowercase hex, repeatable
+  cacheHash: ""                            # 32-char lowercase hex; leave empty
   hashFile: ""                             # snapshot from cache clean --save-hashes
+  loopback: false                          # dial 127.0.0.1, keep the Host header
+  resolve: []                              # "host:port:address" overrides
+  insecureSkipVerify: false                # accept a self-signed certificate
   concurrency: 4
   timeout: 30s                             # a duration string, not a number
   method: get                              # get | head

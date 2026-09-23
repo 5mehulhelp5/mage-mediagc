@@ -46,12 +46,15 @@ loss.
 ## Stage 2 — Thumbnails (zero risk)
 
 ```sh
-# Empty it, recording the size sets before they are destroyed
+# Empty it. The snapshot is optional now, but it saves one request.
 mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt
 
 # Refill it. Dry run first: it costs the whole job without issuing anything.
 mage-mediagc cache warm --hash-file var/cache-hashes.txt
 mage-mediagc cache warm --hash-file var/cache-hashes.txt --apply
+
+# On the shop's own server, where its own domain may not resolve
+mage-mediagc cache warm --loopback --apply
 ```
 
 `cache clean` deletes `pub/media/catalog/product/cache` and recreates the
@@ -66,15 +69,15 @@ every cache file does, and cleaning before quarantining means generating
 thumbnails for images you are about to remove. `cache warm --live-only` buys the
 same saving on its own, at the cost of running the full reference analysis.
 
-The `--save-hashes` file is the part that is easy to leave out and expensive to
-regret. Size sets are Magento's own md5 directory names, derived from
-configuration rather than stored anywhere; after the tree is gone there is
-nothing on the host to discover them from, and `cache warm` can only pick up the
-ones the first visitors happen to request.
-
 `cache warm` pays the regeneration cost up front and concurrently instead of
-putting it on the first visitor. Three properties make it safe against a live
-shop:
+putting it on the first visitor. It issues **one request per original image**,
+not one per variant: since Magento 2.3 a single request regenerates that image
+in every size set the theme defines — 25 of them on a stock theme, so a
+60,000-image catalog is 60,000 requests rather than 1.5 million. Measured on
+2.3.7-p4, a request that generates the whole family takes 0.85–1.24 s and one
+that finds everything already there takes 0.25 ms.
+
+Three properties make it safe against a live shop:
 
 - variants that already exist are skipped with a local `stat`, so an interrupted
   run resumes for free and re-running re-generates nothing;
@@ -82,6 +85,31 @@ shop:
   requests return 200 and no file appears stops immediately, which is what a CDN
   or reverse proxy answering from the edge looks like;
 - the request rate is capped by `warm.concurrency` and, if you want, `--rate`.
+
+A fourth is a refusal: **Magento 2.2 and earlier are rejected before any request
+is sent.** Those releases have no `ImageResize` service, so a request for a
+missing variant returns 404 and generates nothing; the run would fail on every
+URL and the probe would blame the CDN. The error names the missing file and
+points at `bin/magento catalog:images:resize`. `--skip-support-check` overrides
+it once you have confirmed by hand that the install does resize on request.
+
+### Which size set the requests are routed through
+
+A cache URL has to name a size set — one of Magento's md5 directory names, built
+from private PHP-side parameters that derive from the theme's `view.xml` and
+from store configuration. It cannot be computed outside PHP, so the tool
+discovers one, in this order:
+
+1. `--cache-hash`, or `warm.cacheHash` in the config file;
+2. the `--hash-file` snapshot;
+3. the cache tree itself;
+4. a single request, whose answer is then read back off the disk.
+
+Only one is needed, because the request regenerates the rest — but it has to be
+one the theme currently asks for, and a value that has gone stale is detected
+and replaced rather than used. Step 4 is why `--save-hashes` is now a shortcut
+rather than a requirement: a tree that was cleaned with no snapshot at all can
+still be warmed, at the price of one probe request.
 
 Watch it and keep the default four workers until you have measured:
 
@@ -93,9 +121,11 @@ The duration it reports is your throughput. On a busy shop, prefetch during the
 quiet hours and use `--rate` rather than a large `--concurrency`.
 
 This is the one destructive operation worth scheduling automatically — the
-package ships a daily timer for `cache clean`. If you enable `cache warm` on a
-schedule, write `--save-hashes` to a path that survives the clean, or the warm
-run will have nothing to read.
+package ships a daily timer for `cache clean`. Note that the shipped unit does
+not pass `--save-hashes`. If you schedule `cache warm` after it, either add
+`--save-hashes` pointed at a path outside the cache directory (a snapshot inside
+it is destroyed by the very clean it was meant to survive), or accept one probe
+request per run while the size set is recovered from scratch.
 
 ---
 
@@ -366,7 +396,7 @@ server with SSD storage. They are orders of magnitude, not benchmarks:
 | --- | --- | --- |
 | `scan` | ~1.2M files, ~130 GB | ~2–4 minutes |
 | `cache clean` | ~800k files, ~35 GB | ~1–2 minutes |
-| `cache warm` | ~800k variants | hours; see below |
+| `cache warm` | one request per original, ~25 variants each | hours; see below |
 | `quarantine` | ~370k files, ~84 GB | ~1–3 minutes |
 | `restore` | ~370k files | ~1–3 minutes |
 | `db-clean` | ~1.9M rows | ~5–15 minutes |
@@ -377,19 +407,20 @@ on SSD. The file operations are metadata-only and are dominated by directory
 lookups, so high `cleanup.parallel` values help.
 
 `cache warm` is the exception in this table: its cost is not this machine's but
-the storefront's, because every request makes PHP decode, resize and re-encode
-an image. It is also the only operation where throughput is limited by something
-you should be reluctant to maximise — the workers serving your visitors. Measure
-before scaling:
+the storefront's, because every request makes PHP decode the original, then
+resize and re-encode it for every size set the theme defines — 25 of them on a
+stock theme. It is also the only operation where throughput is limited by
+something you should be reluctant to maximise — the workers serving your
+visitors. A request that regenerates a whole family measured 0.85–1.24 s on a
+stock 2.3.7 install, so four workers is 3–5 requests per second and a
+30,000-image catalog is a few hours. Measure before scaling:
 
 ```sh
 mage-mediagc cache warm --hash-file var/cache-hashes.txt --max-requests 500 --apply
 ```
 
-Four workers against a healthy shop typically lands in the low tens of requests
-per second, which puts a million-variant rebuild in the tens of hours. Raising
-`--concurrency` shortens that until the shop's response times degrade, and that
-is the number to find, not the largest one that runs without errors. `--rate` is
-the safer control on a shop that must stay responsive, and warming only the
-images that are still referenced (`--live-only`) can cut the job substantially
-on a catalog with many orphans.
+Raising `--concurrency` shortens that until the shop's response times degrade,
+and that is the number to find, not the largest one that runs without errors.
+`--rate` is the safer control on a shop that must stay responsive, and warming
+only the images that are still referenced (`--live-only`) can cut the job
+substantially on a catalog with many orphans.

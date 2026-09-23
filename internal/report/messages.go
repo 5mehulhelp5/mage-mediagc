@@ -138,7 +138,7 @@ var messageTable = map[string]messages{
 		mdMissingList:      "Missing files (first 50)",
 		mdMoreMissing:      "... %d more; the full list is in the --format json output",
 		mdSteps: []string{
-			"Zero risk first: `mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt` drops the derived thumbnail cache, which Magento rebuilds on demand. The snapshot is the only record of which size sets the theme uses; `mage-mediagc cache warm --hash-file var/cache-hashes.txt` refills the cache up front instead of leaving it to the first visitor.",
+			"Zero risk first: `mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt` drops the derived thumbnail cache, which Magento rebuilds on demand. The snapshot is a convenience, not a requirement: `mage-mediagc cache warm` can recover a size set on its own, and taking one just saves that run its probe request. `mage-mediagc cache warm --hash-file var/cache-hashes.txt` refills the cache up front, one request per original image, instead of leaving it to the first visitor.",
 			"Rehearse the isolation: `mage-mediagc quarantine` reports exactly what would move and refuses to proceed if the orphan ratio looks implausible.",
 			"Then move them: `mage-mediagc quarantine --apply`. Files leave the media tree but are never deleted; `mage-mediagc restore --apply` puts them back.",
 			"After a full traffic cycle with no visible breakage: `mage-mediagc purge --apply` frees the space. This step is permanent.",
@@ -206,7 +206,7 @@ var messageTable = map[string]messages{
 		mdMissingList:      "缺失文件清单（前 50 条）",
 		mdMoreMissing:      "... 其余 %d 条见 --format json 输出",
 		mdSteps: []string{
-			"先做零风险项：`mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt` 清空派生缩略图缓存，Magento 会按需重建。这份快照是主题所用尺寸组合的唯一记录；`mage-mediagc cache warm --hash-file var/cache-hashes.txt` 可以提前重建，而不是把代价留给第一个访客。",
+			"先做零风险项：`mage-mediagc cache clean --apply --save-hashes var/cache-hashes.txt` 清空派生缩略图缓存，Magento 会按需重建。这份快照是便利、不是前提：`mage-mediagc cache warm` 自己也能问回尺寸组合，存快照只是省掉那一次探测请求。`mage-mediagc cache warm --hash-file var/cache-hashes.txt` 可以提前重建（每张原图一个请求），而不是把代价留给第一个访客。",
 			"先预演隔离：`mage-mediagc quarantine` 会报告将移动哪些文件；碎片率异常时会拒绝执行。",
 			"确认后实际隔离：`mage-mediagc quarantine --apply`。文件只是移出媒体目录，并未删除；`mage-mediagc restore --apply` 可原样回滚。",
 			"观察一个完整业务周期且无异常后：`mage-mediagc purge --apply` 才真正释放空间，此步不可逆。",

@@ -128,20 +128,30 @@ Three operations, in increasing order of danger:
 ### `internal/warm` — refilling what `cache clean` emptied
 
 This package is the odd one out: it neither reads the database nor writes to the
-media tree. It plans a set of HTTP requests — every original crossed with every
-size set — and issues them, letting Magento's own image pipeline do the writing.
-Warming is therefore not a privileged operation on the shop; it is what a
-visitor's browser would do, at scale, before anybody is waiting.
+media tree. It plans one HTTP request per original image and issues them, letting
+Magento's own image pipeline do the writing. Warming is therefore not a privileged
+operation on the shop; it is what a visitor's browser would do, at scale, before
+anybody is waiting.
 
-Four decisions shape it.
+**One request per original, not one per variant.** Since Magento 2.3, a request
+for one cached URL regenerates that image's variant in *every* size set the theme
+defines — 25 of them on a stock theme — so the job is as large as the catalog
+rather than as large as the URL space. Measured on 2.3.7-p4: 25 sets from a single
+request, 0.85–1.24 s to generate them and 0.25 ms when they are already there.
+
+Five decisions shape it.
 
 **The size-set hash is discovered, never computed.** Magento names each cache
 directory with an md5 of PHP-side parameters. Reproducing that in Go would mean
-reimplementing code that lives in a module the tool cannot see, and the failure
-mode is quiet: a wrong hash produces a URL space that does not exist, where every
-request returns 200 and generates nothing at all. So the hashes are read off the
-directory listing instead. That is also why `cache clean --save-hashes` exists —
-emptying the cache destroys the only local record of them.
+reimplementing code that lives in a module the tool cannot see. So a set comes
+from `--cache-hash`, from a `--hash-file` snapshot, from the directory listing, or
+— when all three are empty — from a single request whose answer is then read back
+off the disk. What is never done is request with a value nobody has confirmed:
+Magento does not validate the hash in the path, so a made-up one still reaches the
+resize service and regenerates the whole family, while the URL that was actually
+asked for is never created. That asymmetry is why a supplied value is checked
+against the tree and replaced when stale, and why the probe below is not optional
+by default.
 
 **Existence is checked with a local `stat`, not a request.** A skip costs
 nothing, which is what makes an interrupted run nearly free to resume and
@@ -153,6 +163,16 @@ the edge, returning 200 without PHP ever running; without the check, the entire
 run looks successful and the cache stays empty. The probe is one request
 followed by an `os.Stat` of the file it should have produced, and a mismatch
 stops the run before any pool starts.
+
+**Magento 2.2 and earlier are refused before anything is sent.** Those releases
+have no resize service — the media front controller only copies the requested
+file out of the media storage backend — so a request for a missing variant
+returns 404 and generates nothing. The check looks for the class file whose
+presence *is* that boundary, which states the dependency in the thing the request
+path relies on, and it runs before the media tree is walked so the operator sees
+the real cause instead of the 404s the probe would have reported. Both this and
+the probe exist because a run that cannot work should be reported as such, not
+merely fail slowly.
 
 **The rate cap and the failure-rate gate exist because the other end is
 somebody else's server.** Concurrency defaults to four rather than to the scan
@@ -201,6 +221,7 @@ config itself means:
   own indexers afterwards, as the command output says.
 - `cache warm` cannot warm webp or CMYK variants, because Magento decides
   whether to produce those from configuration this tool does not read. It also
-  cannot recover a size set that exists nowhere on disk and has not yet been
-  requested by anybody — after a `cache clean` with no hash snapshot, those come
-  back one request at a time, from traffic.
+  cannot discover a size set that the shop would not produce from a request to
+  the base URL it was given: the cold-start recovery asks one URL, so sets
+  belonging to a different store view will not appear in the answer. Warm each
+  store view separately, one `--base-url` at a time, if that matters.

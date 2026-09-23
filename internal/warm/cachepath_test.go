@@ -1,11 +1,13 @@
 package warm
 
 import (
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shuaiZend/mage-mediagc/internal/media"
 )
@@ -209,7 +211,13 @@ func TestWarmableFile(t *testing.T) {
 		{"cache/" + hashA + "/a/b/c.jpg", false},
 		{"placeholder/placeholder.jpg", false},
 		{"placeholder", false},
-		{"placeholderish/c.jpg", true},
+		// Magento keeps the last three segments of the request path to find
+		// the original, so anything that is not exactly two directories and a
+		// file name would be requested against a different image.
+		{"a/b/c/d.jpg", false},
+		{"a/c.jpg", false},
+		{"c.jpg", false},
+		{"placeholderish/c/d.jpg", true},
 	}
 	for _, c := range cases {
 		if got := warmableFile(c.rel); got != c.want {
@@ -222,15 +230,16 @@ func TestWarmableFile(t *testing.T) {
 // apply exactly the same predicate the plan does.
 func TestWarmableFilesCountsWhatThePlanUses(t *testing.T) {
 	files := []media.File{
-		{RelPath: "a/one.jpg"},
-		{RelPath: "a/two.png"},
-		{RelPath: "a/notes.txt"},
+		{RelPath: "a/b/one.jpg"},
+		{RelPath: "a/b/two.png"},
+		{RelPath: "a/b/notes.txt"},
 		{RelPath: "placeholder/logo.png"},
-		{RelPath: "cache/" + hashA + "/a/one.jpg"},
-		{RelPath: "a/three.gif"},
+		{RelPath: "cache/" + hashA + "/a/b/one.jpg"},
+		{RelPath: "a/b/three.gif"},
+		{RelPath: "a/one.jpg"},
 	}
 	if got := WarmableFiles(files); got != 3 {
-		t.Fatalf("WarmableFiles = %d, want 3 (the jpg, the png and the gif)", got)
+		t.Fatalf("WarmableFiles = %d, want 3 (the jpg, the png and the gif at a valid depth)", got)
 	}
 	if got := WarmableFiles(nil); got != 0 {
 		t.Fatalf("WarmableFiles(nil) = %d, want 0", got)
@@ -253,5 +262,76 @@ func TestParseMethod(t *testing.T) {
 	}
 	if _, err := ParseMethod("post"); err == nil {
 		t.Error("ParseMethod(post) should fail")
+	}
+}
+
+// SeedHash has to be something Magento accepts as a path component. It is
+// never validated — the shop resizes whatever it is handed — but a value of the
+// wrong shape would at least look like a mistake to whoever inspects the logs.
+func TestSeedHashIsAWellFormedHash(t *testing.T) {
+	if !ValidHash(SeedHash) {
+		t.Fatalf("SeedHash = %q is not a valid size-set name", SeedHash)
+	}
+}
+
+// A size set is live only if it holds the variant, which is the same test the
+// plan applies to each item. Directory age says nothing: Magento writes into
+// the sets it wants and never removes the ones it has stopped wanting, so the
+// most recently written directory is often a stale one.
+func TestLiveHashFindsTheSetHoldingTheVariant(t *testing.T) {
+	root := t.TempDir()
+	// A stale set, written most recently, and the live one.
+	seedCache(t, root, hashB, "a/b/c.jpg")
+	if err := os.Chtimes(filepath.Join(CacheDir(root), hashB), time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := LiveHash(CacheDir(root), "a/b/c.jpg")
+	if err != nil {
+		t.Fatalf("LiveHash: %v", err)
+	}
+	if got != hashB {
+		t.Fatalf("LiveHash = %q, want %q", got, hashB)
+	}
+}
+
+func TestLiveHashIgnoresSetsWithoutTheVariant(t *testing.T) {
+	root := t.TempDir()
+	seedCache(t, root, hashA, "a/b/other.jpg")
+	seedCache(t, root, hashB, "a/b/c.jpg")
+
+	got, err := LiveHash(CacheDir(root), "a/b/c.jpg")
+	if err != nil {
+		t.Fatalf("LiveHash: %v", err)
+	}
+	if got != hashB {
+		t.Fatalf("LiveHash = %q, want the set that holds the file, %q", got, hashB)
+	}
+}
+
+func TestLiveHashReportsWhenNoSetHoldsIt(t *testing.T) {
+	root := t.TempDir()
+	seedCache(t, root, hashA, "a/b/other.jpg")
+	if _, err := LiveHash(CacheDir(root), "a/b/c.jpg"); !errors.Is(err, ErrNoLiveHash) {
+		t.Fatalf("err = %v, want ErrNoLiveHash", err)
+	}
+	// An empty or absent cache tree is the same situation, not a crash.
+	if _, err := LiveHash(CacheDir(t.TempDir()), "a/b/c.jpg"); !errors.Is(err, ErrNoLiveHash) {
+		t.Fatalf("err = %v, want ErrNoLiveHash for a missing cache dir", err)
+	}
+}
+
+// CachePath and VariantPath describe the same file, one from a media root and
+// one from a cache directory. If they ever disagreed, LiveHash would confirm a
+// set the plan then fails to find.
+func TestCachePathAndVariantPathAgree(t *testing.T) {
+	root := t.TempDir()
+	for _, h := range []string{hashA, hashB} {
+		for _, rel := range []string{"a/b/c.jpg", "x/y/z name.png", "d/e/f.gif"} {
+			if CachePath(root, h, rel) != VariantPath(CacheDir(root), h, rel) {
+				t.Errorf("CachePath and VariantPath disagree for %s under %s:\n  %s\n  %s",
+					rel, h, CachePath(root, h, rel), VariantPath(CacheDir(root), h, rel))
+			}
+		}
 	}
 }
