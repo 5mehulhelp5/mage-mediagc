@@ -280,6 +280,8 @@ First release.
   both jittered, hardened and disabled by default. Quarantining and database
   cleanup are never scheduled.
 
-[Unreleased]: https://github.com/shuaiZend/mage-mediagc/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/shuaiZend/mage-mediagc/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/shuaiZend/mage-mediagc/releases/tag/v0.3.1
+[0.3.0]: https://github.com/shuaiZend/mage-mediagc/releases/tag/v0.3.0
 [0.2.1]: https://github.com/shuaiZend/mage-mediagc/releases/tag/v0.2.1
 [0.2.0]: https://github.com/shuaiZend/mage-mediagc/releases/tag/v0.2.0
