@@ -255,6 +255,12 @@ Safety rails
     generate nothing — the signature of a CDN or reverse proxy answering from
     the edge without the origin ever being involved. Pass --no-probe to skip
     the check once you have confirmed the URL mapping by hand
+  - the original is stat'd before that verdict is given, so an image that is
+    not on this host is named as such rather than blamed on a CDN: Magento
+    answers a missing original with the placeholder image and a 200, which
+    otherwise looks exactly like an edge cache. Images listed but absent are
+    reported as "missing" and not requested, so a media tree that is not
+    complete cannot end in a clean-looking run
   - the run fails when more than --max-error-fraction of the requests did not
     return 2xx, which usually means the wrong host or a WAF rejecting the
     client
@@ -568,12 +574,27 @@ by default.`,
 				warm.WarmableFiles(files), len(files))
 			fmt.Fprintf(a.stdout, "%-14s: %d\n", "cached", res.Skipped)
 			fmt.Fprintf(a.stdout, "%-14s: %d\n", "to request", res.Pending)
+			if plan.Missing > 0 {
+				fmt.Fprintf(a.stdout, "%-14s: %d\n", "missing", plan.Missing)
+			}
 			if plan.Ineligible > 0 {
 				fmt.Fprintf(a.stdout, "%-14s: %d\n", "excluded", plan.Ineligible)
 			}
 
+			// The two reasons a run can end with no work to do are not
+			// interchangeable, and only one of them is good news.
+			if plan.Missing > 0 {
+				fmt.Fprintf(a.stdout,
+					"\n%d of %d images were listed but are not on this host, so no request can "+
+						"produce a variant for them — Magento answers those with the placeholder "+
+						"image instead. Every other image here is accounted for; these are not\n",
+					plan.Missing, plan.Eligible)
+			}
+
 			if res.Pending == 0 {
-				fmt.Fprintf(a.stdout, "\nnothing to do: every image already has a cached variant\n")
+				if plan.Missing == 0 {
+					fmt.Fprintf(a.stdout, "\nnothing to do: every image already has a cached variant\n")
+				}
 				return nil
 			}
 			if !apply {

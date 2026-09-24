@@ -280,6 +280,21 @@ without PHP ever running. Every subsequent request would also return 200, the
 run would look like a success, and the cache would still be empty. Passing
 `--no-probe` after confirming the URL mapping by hand is the escape hatch.
 
+Before that verdict is given the original is stat'd, because the same 200 with
+nothing written has a second cause that is not about the storefront at all:
+Magento answers a request whose original it cannot find with the placeholder
+image (`Media::launch` catches the resize service's `NotFoundException` and
+serves one), and writes nothing. So the run distinguishes the two and names
+whichever applies. The seed request — the one that asks the shop which size sets
+it uses — refuses on a missing original for the same reason.
+
+Images that are listed but not on disk are then counted rather than requested:
+the plan grows a `missing` row next to `to request`, and `nothing to do` is only
+printed when there really is nothing. A non-zero count means the index and the
+media tree disagree, which is worth acting on before trusting the run — an
+original that did not arrive has no variant, so every page showing it falls back
+to the placeholder image.
+
 #### Re-running and resuming
 
 A variant that already exists is skipped with a local `stat`, not a request.

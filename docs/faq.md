@@ -195,14 +195,38 @@ is why it can run from a laptop or a CI job against a shop it has no route to.
 
 ### Why does `cache warm` say the file was not created?
 
-Because the request succeeded without the origin generating anything — almost
-always a CDN, a Varnish layer or a reverse proxy answering from the edge.
-Magento never ran, no cache file appeared, and the rest of the run would have
-looked like a success while filling nothing. That is why the pre-flight request
-exists, and why the run stops rather than continuing.
+Because the request succeeded without the origin generating anything. There are
+two ways that happens, and the message names which one it was.
 
-Point `--base-url` at the origin. If you have confirmed the URL mapping by hand
-and a manual request really does write the file, `--no-probe` skips the check.
+**Almost always a CDN, a Varnish layer or a reverse proxy answering from the
+edge.** Magento never ran, no cache file appeared, and the rest of the run would
+have looked like a success while filling nothing. Point `--base-url` at the
+origin. If you have confirmed the URL mapping by hand and a manual request really
+does write the file, `--no-probe` skips the check.
+
+**Or the original is not on this host.** Magento answers a request whose original
+it cannot find with the placeholder image and HTTP 200 — `Media::launch` catches
+the resize service's `NotFoundException` and serves one — so from outside it is
+indistinguishable from an edge cache. The probe therefore `stat`s the original
+before giving that verdict, and says so instead. Fix the media tree rather than
+the CDN configuration: this is what a `rsync` that did not finish looks like.
+
+The same screening is applied to the whole plan rather than to the one probed
+image, so it does not depend on which image the probe happened to pick: see the
+next question.
+
+### What does the `missing` row mean?
+
+Images the plan covers that are not on disk. They are counted instead of
+requested, because the request would answer 200 and generate nothing — booking a
+success for a variant that was never written.
+
+A run that scans the same tree it warms normally reports `missing 0`. Anything
+else means the index and the tree disagree, and it is worth understanding before
+trusting the run: a copy that did not finish, a mount that is not the one the web
+server serves, or a file removed as the run started. The consequence of ignoring
+it is quiet — an original with no variant makes every page showing it fall back
+to the placeholder image, and nothing else in the output would have mentioned it.
 
 ### Which size sets does `cache warm` fill?
 

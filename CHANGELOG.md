@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-24
+
+### Fixed
+
+- **`cache warm` tells a missing original apart from a storefront that did not
+  run.** Magento answers a request whose original it cannot find with the
+  placeholder image and HTTP 200, writing nothing. A probe that saw 200 and no
+  file therefore blamed a CDN or reverse proxy, which is a different problem
+  with a different answer. Both the pre-flight probe and the seed request now
+  `stat` the original first and name the cause that actually applies.
+- **A warmable image that is not on disk is counted, not requested.**
+  `BuildPlan` already stat'd each variant; it now stat's the original too, and
+  files that are gone are reported as `missing` rather than sent a request that
+  returns 200 and generates nothing. A plan built from a scan of the same tree
+  normally has none, so a non-zero count means the index and the tree disagree —
+  a copy that did not finish, a mount that is not the one the web server serves,
+  a file removed as the run started. The report grows a `missing` row, and
+  `nothing to do` is now only printed when there really is nothing to do.
+
+  This is the failure that matters after `rsync`-ing a media tree between hosts:
+  an original that did not arrive has no variant, so every page showing it falls
+  back to the placeholder image — and nothing in the run's output used to
+  mention it.
+
 ## [0.3.0] - 2026-09-24
 
 ### Added

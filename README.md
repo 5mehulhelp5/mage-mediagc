@@ -282,14 +282,19 @@ are empty — by asking the shop once and reading the answer off the disk. Only 
 is needed, since the request regenerates the rest, but it has to be one the theme
 currently asks for, and a stale value is detected and replaced.
 
-Three things make it safe against a live shop. Images that already have a
+Four things make it safe against a live shop. Images that already have a
 variant are skipped with a local `stat`, so an interrupted run resumes almost
 free and re-running never re-generates anything. One request is issued first, on
 its own, with its cache file checked for afterwards: a run where requests return
 200 and no file appears stops right there, because that is what a CDN or reverse
-proxy answering from the edge looks like. And Magento 2.2 and earlier are refused
-outright — they generate nothing on request, so the run would be wasted — with
-the check pointing at `bin/magento catalog:images:resize` instead.
+proxy answering from the edge looks like. Before giving that verdict the original
+is `stat`'d — Magento answers a missing original with the placeholder image and a
+200, so without it an incomplete media tree would be misdiagnosed as an edge
+cache. And the whole plan is screened the same way: images that are listed but
+not on disk are reported as `missing` and never requested, because a request that
+cannot produce a file would only book a success. Finally, Magento 2.2 and earlier
+are refused outright — they generate nothing on request, so the run would be
+wasted — with the check pointing at `bin/magento catalog:images:resize` instead.
 
 It is also the better answer to "just run `php bin/magento
 catalog:images:resize`". That command is single-threaded, re-resizes variants

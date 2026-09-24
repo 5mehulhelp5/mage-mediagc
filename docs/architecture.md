@@ -164,6 +164,17 @@ run looks successful and the cache stays empty. The probe is one request
 followed by an `os.Stat` of the file it should have produced, and a mismatch
 stops the run before any pool starts.
 
+**That verdict is not given until the original has been stat'd, and the same
+test is applied to the whole plan.** "200 with no file" has a second cause that
+is not about the storefront: Magento serves the placeholder image when the
+resize service cannot find the original — `Media::launch` catches its
+`NotFoundException` — so a tree that is missing files produces exactly the
+symptom an edge cache does. Stat'ing one file is cheaper than a wrong diagnosis,
+and screening the rest of the plan the same way means the answer does not depend
+on which image the probe happened to pick. Counted, never requested: a request
+that cannot produce a file is not worth making, and booking it as a success is
+how an incomplete media tree ends quietly.
+
 **Magento 2.2 and earlier are refused before anything is sent.** Those releases
 have no resize service — the media front controller only copies the requested
 file out of the media storage backend — so a request for a missing variant

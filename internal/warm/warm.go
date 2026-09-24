@@ -76,6 +76,21 @@ type Plan struct {
 	// reported rather than dropped: a plan that quietly covers less than the
 	// catalog is worse than one that says so.
 	Ineligible int64 `json:"ineligible"`
+	// Missing counts the warmable images listed by the caller whose file is
+	// not on disk after all.
+	//
+	// They are excluded rather than requested, because the request cannot
+	// succeed: Magento answers a URL whose original it cannot find with the
+	// placeholder image and a 200, writing nothing. Asking anyway would book a
+	// success for a variant that was never generated, and the gap would only
+	// surface later as products showing placeholders.
+	//
+	// The count is normally zero, since the index comes from a scan of this
+	// same tree. It is non-zero when the tree and the index disagree — a copy
+	// that did not finish, a mount that is not the one the web server serves,
+	// a file removed while the run was starting — and those are exactly the
+	// cases worth saying out loud.
+	Missing int64 `json:"missing"`
 	// Items holds the originals whose variant is missing, in the order the
 	// scan returned them.
 	Items []Item `json:"-"`
@@ -166,7 +181,14 @@ type ErrProbe struct {
 	CachePath  string
 	SourcePath string
 	Status     int
-	Err        error
+	// SourceMissing says the original is not on this host at all, which is a
+	// different problem from the storefront declining to generate it. The
+	// distinction is the whole reason SourcePath is carried: Magento answers a
+	// request whose original it cannot read with the placeholder image and a
+	// 200, so the failure looks identical to a caching layer answering from the
+	// edge — and the diagnosis for the two is not remotely the same.
+	SourceMissing bool
+	Err           error
 }
 
 func (e *ErrProbe) Error() string {
@@ -177,6 +199,15 @@ func (e *ErrProbe) Error() string {
 		return fmt.Sprintf(
 			"probe request to %s returned HTTP %d. Check --base-url and that the storefront "+
 				"is reachable from this host", e.URL, e.Status)
+	}
+	if e.SourceMissing {
+		return fmt.Sprintf(
+			"probe request to %s returned HTTP %d but %s was not created, and its original %s "+
+				"is not on this host. Magento answers a request for a missing original with "+
+				"the placeholder image and HTTP 200, writing nothing, so this response says "+
+				"nothing about the storefront. Put the originals in place — or point the tool "+
+				"at the media tree the web server actually serves — and run again",
+			e.URL, e.Status, e.CachePath, e.SourcePath)
 	}
 	return fmt.Sprintf(
 		"probe request to %s returned HTTP %d but %s was not created. The original is %s. "+
@@ -212,6 +243,11 @@ func (e *ErrFailureRate) Error() string {
 // interrupted run cheap to pick up again: re-running simply finds less work,
 // with no probing and no wasted traffic.
 //
+// Two things are stat'd, not one. The variant being absent is what makes an
+// item outstanding; the original being absent is what makes it impossible, and
+// it is counted in Missing rather than requested — see the field comment for
+// why answering that request would look like success.
+//
 // hash must be a set the theme asks for. Anything else still fills the cache
 // when requested, but leaves every path in this plan absent, so the run would
 // look like it failed at every step — and, worse, would re-request everything
@@ -243,11 +279,21 @@ func BuildPlan(mediaRoot string, files []media.File, hash string, base *url.URL)
 			p.Skipped++
 			continue
 		}
+		sourcePath := filepath.Join(mediaRoot, filepath.FromSlash(f.RelPath))
+		// A request only produces a variant when the resize service can find
+		// the original. When it cannot, Magento answers with the placeholder
+		// image and a 200 and writes nothing, so requesting this item would
+		// book a success for a file that never appeared. Counting it instead
+		// turns a silent hole in the cache into a number in the report.
+		if !fileExists(sourcePath) {
+			p.Missing++
+			continue
+		}
 		p.Items = append(p.Items, Item{
 			RelPath:    f.RelPath,
 			Hash:       hash,
 			CachePath:  cachePath,
-			SourcePath: filepath.Join(mediaRoot, filepath.FromSlash(f.RelPath)),
+			SourcePath: sourcePath,
 			URL:        CacheURL(base, hash, f.RelPath),
 		})
 	}
@@ -289,6 +335,14 @@ func Seed(ctx context.Context, mediaRoot, relPath string, base *url.URL, opts Op
 		CachePath:  CachePath(mediaRoot, SeedHash, relPath),
 		SourcePath: filepath.Join(mediaRoot, filepath.FromSlash(relPath)),
 		URL:        CacheURL(base, SeedHash, relPath),
+	}
+	// Same reasoning as the pre-flight probe: a missing original answers 200
+	// with the placeholder and writes nothing, so a seed request against one
+	// would be blamed on the storefront rather than on the file that is not
+	// there.
+	if !fileExists(item.SourcePath) {
+		return "", fmt.Errorf("cannot ask the shop which size sets it uses: the original %s "+
+			"is not on this host", item.SourcePath)
 	}
 	r := &runner{client: newClient(opts), method: method, ua: opts.UserAgent, res: &Result{}}
 	code, reqErr := r.fetch(ctx, item)
@@ -366,8 +420,13 @@ func Run(ctx context.Context, plan *Plan, opts Options) (*Result, error) {
 				URL: first.URL, CachePath: first.CachePath, SourcePath: first.SourcePath, Status: code})
 		}
 		if _, statErr := os.Stat(first.CachePath); statErr != nil {
+			// The original was present when the plan was built, so its
+			// absence here means it went away in between. Stat'ing it is one
+			// call, and it turns "something answered without reaching PHP"
+			// into the right answer when that is not what happened.
 			return res, r.finish(started, opts, &ErrProbe{
-				URL: first.URL, CachePath: first.CachePath, SourcePath: first.SourcePath, Status: code})
+				URL: first.URL, CachePath: first.CachePath, SourcePath: first.SourcePath,
+				Status: code, SourceMissing: !fileExists(first.SourcePath)})
 		}
 		start = 1
 	}

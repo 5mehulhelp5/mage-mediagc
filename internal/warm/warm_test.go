@@ -277,6 +277,35 @@ func TestBuildPlanExcludesImagesAtTheWrongDepth(t *testing.T) {
 	}
 }
 
+func TestBuildPlanCountsOriginalsThatAreNotOnDisk(t *testing.T) {
+	root, files := makeMedia(t, "a/b/c.jpg", "a/b/d.jpg")
+	// An index that lists an image the tree no longer holds, which is what a
+	// copy that did not finish leaves behind. Asking for it would answer 200
+	// with the placeholder and write nothing, so it is counted rather than
+	// requested — the alternative is a run that reports success over a hole.
+	if err := os.Remove(filepath.Join(root, "a", "b", "d.jpg")); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := BuildPlan(root, files, hashA, mustParseURL(t, "https://shop.example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Missing != 1 {
+		t.Errorf("Missing = %d, want 1", plan.Missing)
+	}
+	if len(plan.Items) != 1 || plan.Items[0].RelPath != "a/b/c.jpg" {
+		t.Fatalf("Items = %+v, want only the original that is there", plan.Items)
+	}
+	if plan.Eligible != 2 {
+		t.Errorf("Eligible = %d, want 2: a missing original is still an image this route covers",
+			plan.Eligible)
+	}
+	if plan.Skipped != 0 {
+		t.Errorf("Skipped = %d, want 0", plan.Skipped)
+	}
+}
+
 func TestRunDryRunIssuesNothing(t *testing.T) {
 	root, files := makeMedia(t, "a/b/c.jpg", "a/b/d.jpg")
 	fake := newFakeMagento(t, root)
@@ -349,6 +378,42 @@ func TestRunStopsWhenNoFileAppears(t *testing.T) {
 	}
 	if res.Requests != 1 {
 		t.Errorf("Requests = %d, want 1", res.Requests)
+	}
+}
+
+// A 200 that produces no file has two very different causes, and the pre-flight
+// check is the run's only chance to tell them apart. This pins the one that the
+// message used to get wrong.
+func TestRunProbeBlamesTheMissingOriginalNotTheStorefront(t *testing.T) {
+	root, _ := makeMedia(t, "a/b/c.jpg")
+	fake := newFakeMagento(t, root)
+	fake.write = false
+
+	// Hand-built rather than derived from BuildPlan, which now filters this
+	// case out before it can be requested: the point here is what the probe
+	// says when an original goes away after the plan was costed.
+	base := fake.base(t)
+	plan := &Plan{
+		MediaRoot: root,
+		BaseURL:   base.String(),
+		Hash:      hashA,
+		Eligible:  1,
+		Items: []Item{{
+			RelPath:    "a/b/gone.jpg",
+			Hash:       hashA,
+			CachePath:  CachePath(root, hashA, "a/b/gone.jpg"),
+			SourcePath: filepath.Join(root, "a", "b", "gone.jpg"),
+			URL:        CacheURL(base, hashA, "a/b/gone.jpg"),
+		}},
+	}
+	var probe *ErrProbe
+	if _, err := Run(context.Background(), plan, Options{Timeout: 5 * time.Second}); !errors.As(err, &probe) {
+		t.Fatalf("err = %v, want *ErrProbe", err)
+	} else if !probe.SourceMissing {
+		t.Error("SourceMissing = false, want true")
+	}
+	if msg := probe.Error(); !strings.Contains(msg, "original") || strings.Contains(msg, "CDN") {
+		t.Errorf("the probe should name the missing original and not guess at a CDN: %v", msg)
 	}
 }
 
@@ -589,6 +654,26 @@ func TestSeedReportsATransportFailure(t *testing.T) {
 	base := mustParseURL(t, "http://127.0.0.1:1")
 	if _, err := Seed(context.Background(), root, files[0].RelPath, base, Options{Timeout: 2 * time.Second}); err == nil {
 		t.Fatal("expected an error when the storefront is unreachable")
+	}
+}
+
+// The seed request exists to make the shop name its size sets. It cannot do
+// that for an original that is not there, and the placeholder answer it would
+// get back reads as a storefront problem rather than a missing file.
+func TestSeedRefusesWhenTheOriginalIsMissing(t *testing.T) {
+	root, _ := makeMedia(t, "a/b/c.jpg")
+	fake := newFakeMagento(t, root)
+
+	_, err := Seed(context.Background(), root, "a/b/gone.jpg", fake.base(t),
+		Options{Timeout: 5 * time.Second})
+	if err == nil {
+		t.Fatal("Seed should refuse when the original is not on this host")
+	}
+	if !strings.Contains(err.Error(), "gone.jpg") {
+		t.Errorf("err = %v, want it to name the missing original", err)
+	}
+	if n := fake.requests(); n != 0 {
+		t.Errorf("the server saw %d requests; one that cannot produce a file is not worth making", n)
 	}
 }
 

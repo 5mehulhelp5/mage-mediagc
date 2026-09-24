@@ -84,6 +84,12 @@ Three properties make it safe against a live shop:
 - one request is made first, and its cache file checked for — a run where
   requests return 200 and no file appears stops immediately, which is what a CDN
   or reverse proxy answering from the edge looks like;
+- the original behind that request is `stat`'d before the verdict is given, so
+  an image that is not on this host is named as such instead of being blamed on
+  a CDN — Magento answers a missing original with the placeholder image and a
+  200, which looks identical from the outside. The rest of the plan is screened
+  the same way: images that are listed but absent are reported as `missing` and
+  never requested, so an incomplete media tree cannot end in a clean-looking run;
 - the request rate is capped by `warm.concurrency` and, if you want, `--rate`.
 
 A fourth is a refusal: **Magento 2.2 and earlier are rejected before any request
